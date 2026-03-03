@@ -416,7 +416,7 @@ ALLOWED_TOOLS = {
 }
 
 options = ClaudeAgentOptions(
-    model="haiku",                    # Cost-efficient for routine checks
+    model="claude-sonnet-4-6",         # Sonnet 4.6 for all checks
     max_turns=25,                     # Cap per check cycle (see note below)
     permission_mode="acceptEdits",    # No file edits needed; safe default
     system_prompt=SYSTEM_PROMPT,
@@ -645,7 +645,7 @@ finish before forced termination.
 check_interval: 300
 
 # Model to use for analysis
-model: haiku
+model: claude-sonnet-4-6
 
 # Maximum agent turns per check cycle
 max_turns: 25
@@ -865,8 +865,8 @@ agent-mon --interactive --config config.yaml
    token usage. If the agent consistently hits the turn limit, that is logged as
    an operational warning.
 
-7. **Model selection**: Uses `haiku` by default for cost efficiency. Can be
-   switched to `sonnet` or `opus` for deeper analysis on demand.
+7. **Model selection**: Uses Sonnet 4.6 (`claude-sonnet-4-6`) by default,
+   balancing capability and cost. Can be switched to Opus for deeper analysis.
 
 8. **No destructive built-in tools**: The agent has NO access to `Bash`, `Write`,
    `Edit`, or other file-manipulation tools. It can only use the custom MCP tools
@@ -898,9 +898,9 @@ agent-mon --interactive --config config.yaml
 |-----------|-------------------|-------|
 | Input tokens | ~2-4K | System prompt + tool results |
 | Output tokens | ~500-1K | Analysis + tool calls |
-| Haiku cost | ~$0.001-0.003 | Per check cycle |
-| Daily (5min interval) | ~$0.30-0.85 | 288 checks/day |
-| Daily (1min interval) | ~$1.50-4.30 | 1440 checks/day |
+| Sonnet 4.6 cost | ~$0.01-0.03 | Per check cycle ($3/MTok in, $15/MTok out) |
+| Daily (5min interval) | ~$4-8 | 288 checks/day |
+| Daily (1min interval) | ~$19-39 | 1440 checks/day |
 
 Session reuse (`resume`) can reduce input tokens on subsequent checks since
 Claude retains context about the system's baseline.

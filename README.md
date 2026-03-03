@@ -48,8 +48,7 @@ reason about what's actually happening:
 - Container restarting + memory spike + OOM in dmesg = "memory leak in the app, not infra"
 - 50 failed SSH attempts from one IP + new listening port = "possible breach, escalate now"
 
-It collects, analyzes, alerts, and auto-remediates — every 5 minutes, unattended,
-for less than a dollar a day.
+It collects, analyzes, alerts, and auto-remediates — every 5 minutes, unattended.
 
 ---
 
@@ -184,7 +183,7 @@ cat /var/log/agent-mon/alerts.jsonl | jq .
 
 ```yaml
 check_interval: 300                   # seconds between checks (default: 5 min)
-model: haiku                          # haiku | sonnet | opus
+model: claude-sonnet-4-6              # claude-sonnet-4-6 | claude-opus-4-6
 max_turns: 25                         # max agent tool calls per cycle
 
 thresholds:
@@ -306,14 +305,14 @@ multiple independent safety layers:
 
 ## Cost
 
-| Interval | Checks/day | Est. daily cost (Haiku) |
-|----------|-----------|------------------------|
-| 5 min | 288 | $0.30 - $0.85 |
-| 1 min | 1,440 | $1.50 - $4.30 |
+| Interval | Checks/day | Est. daily cost (Sonnet 4.6) |
+|----------|-----------|-------------------------------|
+| 5 min | 288 | $4 - $8 |
+| 1 min | 1,440 | $19 - $39 |
 
-Each check uses ~2-4K input tokens and ~500-1K output tokens. The default
-model is Haiku for cost efficiency. Switch to Sonnet or Opus in config for
-deeper analysis when needed.
+Each check uses ~2-4K input tokens and ~500-1K output tokens with Sonnet 4.6
+($3/MTok input, $15/MTok output). Switch to Opus in config for deeper analysis
+when needed.
 
 ---
 
