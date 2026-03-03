@@ -1,0 +1,109 @@
+name: Deploy to Hetzner VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest --tb=short -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_TAILSCALE_IP }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          # Setup SSH key
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          SSH_CMD="ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=accept-new ${VPS_USER}@${VPS_HOST}"
+
+          # Sync code to VPS
+          rsync -azP --delete \
+            --exclude '.git' \
+            --exclude '__pycache__' \
+            --exclude '*.egg-info' \
+            --exclude '.pytest_cache' \
+            -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=accept-new" \
+            ./ "${VPS_USER}@${VPS_HOST}:/opt/agent-mon/"
+
+          # Install and restart service
+          $SSH_CMD << 'DEPLOY'
+            set -euo pipefail
+
+            cd /opt/agent-mon
+
+            # Ensure python venv exists
+            if [ ! -d .venv ]; then
+              python3 -m venv .venv
+            fi
+
+            source .venv/bin/activate
+            pip install --upgrade pip
+            pip install -e .
+
+            # Install systemd unit if not present
+            if [ ! -f /etc/systemd/system/agent-mon.service ]; then
+              sudo tee /etc/systemd/system/agent-mon.service > /dev/null << 'UNIT'
+          [Unit]
+          Description=agent-mon - AI-powered system monitoring
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=agent-mon
+          Group=agent-mon
+          WorkingDirectory=/opt/agent-mon
+          ExecStart=/opt/agent-mon/.venv/bin/agent-mon
+          Restart=on-failure
+          RestartSec=10
+          EnvironmentFile=-/etc/agent-mon/env
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+              sudo systemctl daemon-reload
+              sudo systemctl enable agent-mon
+            fi
+
+            sudo systemctl restart agent-mon
+            sleep 2
+            sudo systemctl is-active agent-mon
+          DEPLOY
+
+          echo "Deployment complete"
