@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
-import sys
 import time
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import aiohttp
@@ -16,25 +15,13 @@ from agent_mon.config import Config
 
 logger = logging.getLogger(__name__)
 
-SEVERITY_COLORS = {
-    "info": "\033[36m",      # cyan
-    "warning": "\033[33m",   # yellow
-    "critical": "\033[31m",  # red
-}
-RESET = "\033[0m"
-
 SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 
 
 class AlertManager:
-    """Manages alert dispatch: stdout, JSON Lines log, email via Resend."""
+    """Manages alert dispatch: plain text log file + email via Resend."""
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        max_bytes: int | None = None,
-    ):
+    def __init__(self, config: Config):
         self.config = config
         self.http_session: aiohttp.ClientSession | None = None
         self.hostname = socket.gethostname()
@@ -42,63 +29,35 @@ class AlertManager:
         # Email dedup tracking: title -> last_sent_timestamp
         self._email_dedup: dict[str, float] = {}
 
-        # Set up log handler
+        # Ensure log directory exists
         log_path = Path(config.alerts.log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if max_bytes is not None:
-            mb = max_bytes
-        else:
-            mb = config.alerts.log_max_size_mb * 1024 * 1024
-
-        self.log_handler = RotatingFileHandler(
-            str(log_path),
-            maxBytes=mb,
-            backupCount=config.alerts.log_max_files,
-        )
 
     async def send_alert(
         self, severity: str, title: str, message: str
     ) -> str:
-        """Dispatch alert to all configured channels."""
+        """Dispatch alert to log file and optionally email."""
         results = []
 
-        # 1. stdout
-        if self.config.alerts.stdout:
-            color = SEVERITY_COLORS.get(severity, "")
-            print(
-                f"{color}[{severity.upper()}] {title}: {message}{RESET}",
-                file=sys.stderr,
-            )
-            results.append("stdout: sent")
+        # 1. Append to plain text log file
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        log_line = f"[{timestamp}] [{severity.upper()}] {title}: {message}\n"
 
-        # 2. JSON Lines log
-        record = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "severity": severity,
-            "title": title,
-            "message": message,
-            "hostname": self.hostname,
-        }
-        line = json.dumps(record)
-        log_record = logging.LogRecord(
-            name="agent_mon.alerts",
-            level=logging.INFO,
-            pathname="",
-            lineno=0,
-            msg=line,
-            args=(),
-            exc_info=None,
-        )
-        self.log_handler.emit(log_record)
-        results.append("log: written")
+        try:
+            with open(self.config.alerts.log_file, "a") as f:
+                f.write(log_line)
+            results.append("log: written")
+        except OSError as exc:
+            logger.warning("Failed to write alert log: %s", exc)
+            results.append(f"log: failed ({exc})")
 
-        # 3. Email via Resend
+        # 2. Email via Resend
         email_config = self.config.alerts.email
         if (
             email_config.enabled
             and self.http_session is not None
-            and SEVERITY_RANK.get(severity, 0) >= SEVERITY_RANK.get(email_config.min_severity, 1)
+            and SEVERITY_RANK.get(severity, 0)
+            >= SEVERITY_RANK.get(email_config.min_severity, 1)
         ):
             if self._should_send_email(title):
                 try:
@@ -141,32 +100,19 @@ class AlertManager:
 
     @staticmethod
     def _get_resend_key() -> str:
-        import os
         return os.environ.get("RESEND_API_KEY", "")
 
     def get_alert_history(self, last_n: int = 20) -> str:
-        """Return recent alerts from the JSON Lines log file."""
+        """Return recent alerts from the log file."""
         log_path = Path(self.config.alerts.log_file)
         if not log_path.exists():
             return "No alert history (log file does not exist)"
 
         text = log_path.read_text()
-        lines = [l for l in text.strip().split("\n") if l.strip()]
+        lines = [line for line in text.strip().split("\n") if line.strip()]
 
         if not lines:
             return "No alert history (log file is empty)"
 
         recent = lines[-last_n:]
-        entries = []
-        for line in recent:
-            try:
-                record = json.loads(line)
-                entries.append(
-                    f"[{record.get('timestamp', '?')}] "
-                    f"[{record.get('severity', '?').upper()}] "
-                    f"{record.get('title', '?')}: {record.get('message', '')}"
-                )
-            except json.JSONDecodeError:
-                continue
-
-        return "\n".join(entries) if entries else "No alert history"
+        return "\n".join(recent)

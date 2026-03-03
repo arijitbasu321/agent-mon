@@ -1,92 +1,120 @@
-"""Tests for PreToolUse hooks: tool allowlist guard and Docker remediation guard.
+"""Tests for PreToolUse hooks: bash deny-list guard and Docker remediation guard.
 
 Covers:
-- Catch-all allowlist hook allows/denies correct tools
+- Bash deny-list blocks dangerous commands (case-insensitive substring match)
+- Bash deny-list allows safe commands
 - Docker remediation guard checks container allow-list
 - Docker remediation guard enforces rate limits
-- Docker stop_container is also gated
 """
 
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
 from agent_mon.hooks import (
-    ALLOWED_TOOLS,
+    bash_denylist_guard,
     docker_remediation_guard,
-    tool_allowlist_guard,
+    reset_rate_limits,
 )
 
 
 # ===========================================================================
-# Tool allowlist guard
+# Bash deny-list guard
 # ===========================================================================
 
 
-class TestToolAllowlistGuard:
-    """Test the catch-all PreToolUse hook."""
+class TestBashDenylistGuard:
+    """Test the bash deny-list PreToolUse hook."""
+
+    @pytest.fixture
+    def config(self):
+        config = MagicMock()
+        config.bash.deny_list = [
+            "rm -rf /",
+            "rm -rf /*",
+            "shutdown",
+            "reboot",
+            "poweroff",
+            "halt",
+            "mkfs",
+            "dd if=",
+            ":(){ :|:& };:",
+            "fdisk",
+            "chmod -R 777 /",
+        ]
+        return config
 
     @pytest.mark.parametrize(
-        "tool_name",
+        "command",
         [
-            "mcp__monitoring__get_cpu_info",
-            "mcp__monitoring__get_memory_info",
-            "mcp__monitoring__get_disk_info",
-            "mcp__monitoring__get_io_info",
-            "mcp__monitoring__get_process_list",
-            "mcp__monitoring__get_security_info",
-            "mcp__monitoring__get_system_issues",
-            "mcp__monitoring__send_alert",
-            "mcp__monitoring__get_alert_history",
-            "mcp__monitoring__kill_process",
-            "mcp__monitoring__restart_service",
-            "mcp__docker__list_containers",
-            "mcp__docker__inspect_container",
-            "mcp__docker__container_logs",
-            "mcp__docker__container_stats",
-            "mcp__docker__restart_container",
-            "mcp__docker__start_container",
-            "mcp__docker__stop_container",
-            "mcp__docker__list_images",
+            "ps aux",
+            "top -bn1",
+            "df -h",
+            "free -m",
+            "journalctl -p err --since '1 hour ago'",
+            "ss -tlnp",
+            "systemctl list-units --failed",
+            "uptime",
+            "cat /proc/loadavg",
+            "systemctl restart nginx",
+            "docker ps",
+            "rm /tmp/test.log",
         ],
     )
-    def test_allows_all_listed_tools(self, tool_name):
-        result = tool_allowlist_guard(tool_name, {})
+    def test_allows_safe_commands(self, config, command):
+        result = bash_denylist_guard(
+            "Bash", {"command": command}, config=config
+        )
         assert result.decision == "allow"
 
     @pytest.mark.parametrize(
-        "tool_name",
+        "command",
         [
-            "Bash",
-            "Write",
-            "Edit",
-            "Read",
-            "Glob",
-            "Grep",
-            "mcp__monitoring__unknown_tool",
-            "mcp__docker__remove_container",
-            "mcp__docker__pull_image",
-            "mcp__unknown__something",
-            "",
+            "rm -rf /",
+            "rm -rf /*",
+            "sudo rm -rf /",
+            "shutdown -h now",
+            "reboot",
+            "mkfs.ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            ":(){ :|:& };:",
+            "fdisk /dev/sda",
+            "chmod -R 777 /",
         ],
     )
-    def test_denies_unlisted_tools(self, tool_name):
-        result = tool_allowlist_guard(tool_name, {})
+    def test_blocks_dangerous_commands(self, config, command):
+        result = bash_denylist_guard(
+            "Bash", {"command": command}, config=config
+        )
         assert result.decision == "deny"
-        assert tool_name in result.reason
+        assert "deny-list" in result.reason
 
-    def test_allowed_tools_set_has_expected_count(self):
-        """Sanity check: should have 19 tools (11 monitoring + 8 Docker)."""
-        assert len(ALLOWED_TOOLS) == 19
+    def test_case_insensitive_matching(self, config):
+        result = bash_denylist_guard(
+            "Bash", {"command": "SHUTDOWN -h now"}, config=config
+        )
+        assert result.decision == "deny"
 
-    def test_no_bash_in_allowed_tools(self):
-        assert "Bash" not in ALLOWED_TOOLS
+    def test_allows_empty_command(self, config):
+        result = bash_denylist_guard(
+            "Bash", {"command": ""}, config=config
+        )
+        assert result.decision == "allow"
 
-    def test_no_write_in_allowed_tools(self):
-        assert "Write" not in ALLOWED_TOOLS
+    def test_allows_no_command_key(self, config):
+        result = bash_denylist_guard(
+            "Bash", {}, config=config
+        )
+        assert result.decision == "allow"
 
-    def test_no_edit_in_allowed_tools(self):
-        assert "Edit" not in ALLOWED_TOOLS
+    def test_empty_deny_list_allows_all(self):
+        config = MagicMock()
+        config.bash.deny_list = []
+        result = bash_denylist_guard(
+            "Bash", {"command": "rm -rf /"}, config=config
+        )
+        assert result.decision == "allow"
 
 
 # ===========================================================================
@@ -99,9 +127,6 @@ class TestDockerRemediationGuard:
 
     @pytest.fixture
     def remediation_config(self):
-        """Return a mock config with allowed containers and rate limit."""
-        from unittest.mock import MagicMock
-
         config = MagicMock()
         config.remediation.enabled = True
         config.remediation.allowed_restart_containers = ["nginx", "redis", "postgres"]
@@ -164,8 +189,6 @@ class TestDockerRemediationRateLimit:
 
     @pytest.fixture
     def remediation_config(self):
-        from unittest.mock import MagicMock
-
         config = MagicMock()
         config.remediation.enabled = True
         config.remediation.allowed_restart_containers = ["nginx"]
@@ -174,15 +197,11 @@ class TestDockerRemediationRateLimit:
 
     @pytest.fixture(autouse=True)
     def reset_rate_limiter(self):
-        """Reset the rate limiter state between tests."""
-        from agent_mon.hooks import reset_rate_limits
-
         reset_rate_limits()
         yield
         reset_rate_limits()
 
     def test_allows_up_to_max_attempts(self, remediation_config):
-        # First attempt
         r1 = docker_remediation_guard(
             "mcp__docker__restart_container",
             {"container": "nginx"},
@@ -190,7 +209,6 @@ class TestDockerRemediationRateLimit:
         )
         assert r1.decision == "allow"
 
-        # Second attempt
         r2 = docker_remediation_guard(
             "mcp__docker__restart_container",
             {"container": "nginx"},
@@ -206,7 +224,6 @@ class TestDockerRemediationRateLimit:
                 config=remediation_config,
             )
 
-        # This should be denied
         result = docker_remediation_guard(
             "mcp__docker__restart_container",
             {"container": "nginx"},

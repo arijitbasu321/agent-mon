@@ -18,17 +18,6 @@ class ConfigError(Exception):
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ThresholdsConfig:
-    cpu_warning: int
-    cpu_critical: int
-    memory_warning: int
-    memory_critical: int
-    disk_warning: int
-    disk_critical: int
-    swap_warning: int
-
-
-@dataclass
 class EmailConfig:
     enabled: bool = False
     from_addr: str = ""
@@ -39,11 +28,20 @@ class EmailConfig:
 
 @dataclass
 class AlertsConfig:
-    stdout: bool = True
-    log_file: str = "/var/log/agent-mon/alerts.jsonl"
-    log_max_size_mb: int = 10
-    log_max_files: int = 5
+    log_file: str = "/var/log/agent-mon.log"
     email: EmailConfig = field(default_factory=EmailConfig)
+
+
+@dataclass
+class HeartbeatConfig:
+    enabled: bool = False
+    interval: int = 3600
+
+
+@dataclass
+class WatchedProcessConfig:
+    name: str
+    restart_command: str
 
 
 @dataclass
@@ -51,7 +49,6 @@ class RemediationConfig:
     enabled: bool = False
     allowed_restart_containers: list[str] = field(default_factory=list)
     allowed_restart_services: list[str] = field(default_factory=list)
-    allowed_kill_targets: list[str] = field(default_factory=list)
     max_restart_attempts: int = 3
 
 
@@ -61,13 +58,30 @@ class DockerConfig:
 
 
 @dataclass
+class BashConfig:
+    deny_list: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MemoryConfig:
+    enabled: bool = True
+    path: str = "/var/lib/agent-mon/memory"
+    collection_name: str = "agent_mon_memory"
+    max_results: int = 5
+
+
+@dataclass
 class Config:
     check_interval: int
     model: str
     max_turns: int
-    thresholds: ThresholdsConfig
     alerts: AlertsConfig
     remediation: RemediationConfig
+    bash: BashConfig
+    memory: MemoryConfig
+    heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
+    watched_processes: list[WatchedProcessConfig] = field(default_factory=list)
+    watched_containers: list[str] = field(default_factory=list)
     docker: DockerConfig = field(default_factory=DockerConfig)
 
     # ------------------------------------------------------------------
@@ -97,8 +111,6 @@ class Config:
             raise ConfigError("Missing required field: check_interval")
         if "model" not in raw:
             raise ConfigError("Missing required field: model")
-        if "thresholds" not in raw:
-            raise ConfigError("Missing required field: thresholds")
 
         check_interval = raw["check_interval"]
         if not isinstance(check_interval, (int, float)) or check_interval < 30:
@@ -108,58 +120,48 @@ class Config:
         if not isinstance(max_turns, int) or max_turns <= 0:
             raise ConfigError("max_turns must be a positive integer")
 
-        # --- thresholds ---
-        thresholds = cls._parse_thresholds(raw["thresholds"])
-
         # --- alerts ---
         alerts = cls._parse_alerts(raw.get("alerts", {}))
 
+        # --- heartbeat ---
+        heartbeat = cls._parse_heartbeat(raw.get("heartbeat", {}))
+
+        # --- watched processes ---
+        watched_processes = cls._parse_watched_processes(
+            raw.get("watched_processes", [])
+        )
+
+        # --- watched containers ---
+        watched_containers = raw.get("watched_containers", [])
+
         # --- remediation ---
-        remediation = cls._parse_remediation(raw.get("remediation", {}))
+        remediation = cls._parse_remediation(
+            raw.get("remediation", {}), watched_containers
+        )
 
         # --- docker ---
         docker_raw = raw.get("docker", {})
         docker = DockerConfig(enabled=docker_raw.get("enabled", False))
 
+        # --- bash ---
+        bash = cls._parse_bash(raw.get("bash", {}))
+
+        # --- memory ---
+        memory = cls._parse_memory(raw.get("memory", {}))
+
         return cls(
             check_interval=int(check_interval),
             model=raw["model"],
             max_turns=max_turns,
-            thresholds=thresholds,
             alerts=alerts,
+            heartbeat=heartbeat,
+            watched_processes=watched_processes,
+            watched_containers=watched_containers,
             remediation=remediation,
             docker=docker,
+            bash=bash,
+            memory=memory,
         )
-
-    @classmethod
-    def _parse_thresholds(cls, raw: dict) -> ThresholdsConfig:
-        required = [
-            "cpu_warning", "cpu_critical",
-            "memory_warning", "memory_critical",
-            "disk_warning", "disk_critical",
-            "swap_warning",
-        ]
-        for key in required:
-            if key not in raw:
-                raise ConfigError(f"Missing threshold: {key}")
-
-        for key, val in raw.items():
-            if not isinstance(val, (int, float)):
-                raise ConfigError(f"Threshold {key} must be numeric")
-            if val < 0 or val > 100:
-                raise ConfigError(f"Threshold {key} must be 0-100, got {val}")
-
-        # warning < critical checks
-        for metric in ("cpu", "memory", "disk"):
-            w = raw[f"{metric}_warning"]
-            c = raw[f"{metric}_critical"]
-            if w >= c:
-                raise ConfigError(
-                    f"{metric}_warning ({w}) must be less than "
-                    f"{metric}_critical ({c})"
-                )
-
-        return ThresholdsConfig(**{k: raw[k] for k in required})
 
     @classmethod
     def _parse_alerts(cls, raw: dict) -> AlertsConfig:
@@ -183,24 +185,70 @@ class Config:
             )
 
         return AlertsConfig(
-            stdout=raw.get("stdout", True),
-            log_file=raw.get("log_file", "/var/log/agent-mon/alerts.jsonl"),
-            log_max_size_mb=raw.get("log_max_size_mb", 10),
-            log_max_files=raw.get("log_max_files", 5),
+            log_file=raw.get("log_file", "/var/log/agent-mon.log"),
             email=email,
         )
 
     @classmethod
-    def _parse_remediation(cls, raw: dict) -> RemediationConfig:
+    def _parse_heartbeat(cls, raw: dict) -> HeartbeatConfig:
+        if not raw:
+            return HeartbeatConfig()
+
+        enabled = raw.get("enabled", False)
+        interval = raw.get("interval", 3600)
+
+        if isinstance(interval, (int, float)) and interval < 60:
+            raise ConfigError("heartbeat interval must be >= 60 seconds")
+
+        return HeartbeatConfig(
+            enabled=enabled,
+            interval=int(interval),
+        )
+
+    @classmethod
+    def _parse_watched_processes(
+        cls, raw: list,
+    ) -> list[WatchedProcessConfig]:
+        if not raw:
+            return []
+
+        result = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ConfigError("Each watched_process must be a mapping")
+            if "name" not in entry:
+                raise ConfigError(
+                    "Each watched_process must have a 'name' field"
+                )
+            if "restart_command" not in entry:
+                raise ConfigError(
+                    "Each watched_process must have a 'restart_command' field"
+                )
+            result.append(WatchedProcessConfig(
+                name=entry["name"],
+                restart_command=entry["restart_command"],
+            ))
+        return result
+
+    @classmethod
+    def _parse_remediation(
+        cls, raw: dict, watched_containers: list[str],
+    ) -> RemediationConfig:
         if not raw:
             return RemediationConfig()
 
         enabled = raw.get("enabled", False)
+
+        # Auto-merge watched_containers into allowed_restart_containers
+        explicit_containers = raw.get("allowed_restart_containers", [])
+        merged_containers = list(dict.fromkeys(
+            explicit_containers + watched_containers
+        ))
+
         config = RemediationConfig(
             enabled=enabled,
-            allowed_restart_containers=raw.get("allowed_restart_containers", []),
+            allowed_restart_containers=merged_containers,
             allowed_restart_services=raw.get("allowed_restart_services", []),
-            allowed_kill_targets=raw.get("allowed_kill_targets", []),
             max_restart_attempts=raw.get("max_restart_attempts", 3),
         )
 
@@ -211,7 +259,6 @@ class Config:
             has_targets = (
                 config.allowed_restart_containers
                 or config.allowed_restart_services
-                or config.allowed_kill_targets
             )
             if not has_targets:
                 raise ConfigError(
@@ -219,6 +266,27 @@ class Config:
                 )
 
         return config
+
+    @classmethod
+    def _parse_bash(cls, raw: dict) -> BashConfig:
+        if not raw:
+            return BashConfig()
+
+        return BashConfig(
+            deny_list=raw.get("deny_list", []),
+        )
+
+    @classmethod
+    def _parse_memory(cls, raw: dict) -> MemoryConfig:
+        if not raw:
+            return MemoryConfig()
+
+        return MemoryConfig(
+            enabled=raw.get("enabled", True),
+            path=raw.get("path", "/var/lib/agent-mon/memory"),
+            collection_name=raw.get("collection_name", "agent_mon_memory"),
+            max_results=raw.get("max_results", 5),
+        )
 
     # ------------------------------------------------------------------
     # Environment validation
@@ -228,8 +296,11 @@ class Config:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise ConfigError("ANTHROPIC_API_KEY environment variable is not set")
 
-        if self.alerts.email.enabled and not os.environ.get("RESEND_API_KEY"):
+        needs_resend = (
+            self.alerts.email.enabled or self.heartbeat.enabled
+        )
+        if needs_resend and not os.environ.get("RESEND_API_KEY"):
             raise ConfigError(
                 "RESEND_API_KEY environment variable is not set "
-                "(required when email alerts are enabled)"
+                "(required when email alerts or heartbeat are enabled)"
             )

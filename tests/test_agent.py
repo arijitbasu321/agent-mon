@@ -4,8 +4,9 @@ Covers:
 - CircuitBreaker state machine (CLOSED -> OPEN -> HALF_OPEN -> CLOSED)
 - AgentDaemon scheduler loop
 - Graceful shutdown via SIGTERM/SIGINT
-- Degraded mode fallback when API is unavailable
+- Degraded mode fallback (subprocess-based, no psutil)
 - Check cycle error handling
+- Heartbeat loop
 """
 
 import asyncio
@@ -15,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_mon.agent import AgentDaemon, CircuitBreaker
+from agent_mon.agent import AgentDaemon, CircuitBreaker, degraded_check
 
 
 # ===========================================================================
@@ -115,7 +116,6 @@ class TestCircuitBreakerHalfOpen:
         cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0)
         cb.record_failure()
         assert cb.state == CircuitBreaker.OPEN
-        # With recovery_timeout=0, should immediately transition
         result = cb.should_attempt_api_call()
         assert result is True
         assert cb.state == CircuitBreaker.HALF_OPEN
@@ -148,20 +148,16 @@ class TestCircuitBreakerFullCycle:
     def test_full_recovery_cycle(self):
         cb = CircuitBreaker(failure_threshold=2, recovery_timeout=0)
 
-        # CLOSED: normal operation
         assert cb.state == CircuitBreaker.CLOSED
         assert cb.should_attempt_api_call() is True
 
-        # Two failures -> OPEN
         cb.record_failure()
         cb.record_failure()
         assert cb.state == CircuitBreaker.OPEN
         assert cb.should_attempt_api_call() is True  # timeout=0 -> HALF_OPEN
 
-        # HALF_OPEN: try one call
         assert cb.state == CircuitBreaker.HALF_OPEN
 
-        # Success -> CLOSED
         cb.record_success()
         assert cb.state == CircuitBreaker.CLOSED
         assert cb.consecutive_failures == 0
@@ -213,12 +209,9 @@ class TestAgentDaemonShutdown:
         await daemon_with_config._cleanup()
 
     async def test_scheduler_exits_on_shutdown_event(self, daemon_with_config):
-        """Scheduler should exit promptly when shutdown is requested."""
         daemon_with_config._run_check_cycle = AsyncMock()
-        # Request shutdown before scheduler starts
         daemon_with_config.shutdown_event.set()
 
-        # Should exit without running any cycles
         await daemon_with_config._run_scheduler()
         daemon_with_config._run_check_cycle.assert_not_awaited()
 
@@ -238,7 +231,6 @@ class TestAgentDaemonCheckCycle:
     async def test_check_cycle_exception_does_not_crash_scheduler(
         self, daemon_with_config
     ):
-        """If a check cycle raises, the scheduler should continue."""
         call_count = 0
 
         async def failing_check():
@@ -246,17 +238,15 @@ class TestAgentDaemonCheckCycle:
             call_count += 1
             if call_count == 1:
                 raise RuntimeError("API error")
-            # On second call, request shutdown to stop the loop
             daemon_with_config.shutdown_event.set()
 
         daemon_with_config._run_check_cycle = failing_check
-        daemon_with_config.config.check_interval = 0  # no wait between cycles
+        daemon_with_config.config.check_interval = 0
 
         await daemon_with_config._run_scheduler()
-        assert call_count == 2  # Ran twice — survived the first failure
+        assert call_count == 2
 
     async def test_check_in_progress_flag(self, daemon_with_config):
-        """check_in_progress should be True during cycle and False after."""
         was_in_progress = None
 
         async def capture_flag():
@@ -272,100 +262,85 @@ class TestAgentDaemonCheckCycle:
         assert daemon_with_config.check_in_progress is False
 
 
+class TestHeartbeatLoop:
+    """Test the heartbeat loop."""
+
+    @pytest.fixture
+    def daemon_with_heartbeat(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.heartbeat.enabled = True
+        config.heartbeat.interval = 1
+        daemon = AgentDaemon(config)
+        daemon.http_session = AsyncMock()
+        return daemon
+
+    async def test_heartbeat_exits_on_shutdown(self, daemon_with_heartbeat, monkeypatch):
+        monkeypatch.setenv("RESEND_API_KEY", "re_test_key")
+        send_count = 0
+
+        async def counting_send():
+            nonlocal send_count
+            send_count += 1
+            daemon_with_heartbeat.shutdown_event.set()
+
+        daemon_with_heartbeat._send_heartbeat = counting_send
+
+        await daemon_with_heartbeat._run_heartbeat_loop()
+        assert send_count == 1
+
+
 class TestDegradedMode:
-    """Test Python-only degraded check when API is unavailable."""
+    """Test subprocess-based degraded check when API is unavailable."""
 
-    async def test_degraded_check_fires_on_critical_disk(
-        self, config_yaml_file, mock_aiohttp_session
-    ):
-        from agent_mon.agent import degraded_check
+    async def test_degraded_check_always_sends_meta_alert(self, config_yaml_file):
         from agent_mon.config import Config
 
         config = Config.from_file(config_yaml_file)
 
-        mock_part = MagicMock()
-        mock_part.mountpoint = "/"
-        mock_usage = MagicMock()
-        mock_usage.percent = 97.0  # above 95% critical threshold
+        with patch("agent_mon.agent.subprocess") as mock_subprocess:
+            # Mock all subprocess.run calls to return empty/safe output
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = ""
+            mock_subprocess.run.return_value = mock_result
+            mock_subprocess.TimeoutExpired = TimeoutError
 
-        with patch("agent_mon.agent.psutil") as mock_psutil:
-            mock_psutil.disk_partitions.return_value = [mock_part]
-            mock_psutil.disk_usage.return_value = mock_usage
-            mock_psutil.virtual_memory.return_value = MagicMock(percent=50.0)
-            mock_psutil.cpu_percent.return_value = 30.0
+            alerts = await degraded_check(config)
 
-            alerts = await degraded_check(config, mock_aiohttp_session)
-
-        # Should have at least a disk alert and the degraded-mode meta-alert
-        assert any("97.0%" in str(a) for a in alerts)
-
-    async def test_degraded_check_fires_on_critical_memory(
-        self, config_yaml_file, mock_aiohttp_session
-    ):
-        from agent_mon.agent import degraded_check
-        from agent_mon.config import Config
-
-        config = Config.from_file(config_yaml_file)
-
-        with patch("agent_mon.agent.psutil") as mock_psutil:
-            mock_psutil.disk_partitions.return_value = []
-            mock_psutil.virtual_memory.return_value = MagicMock(percent=98.0)
-            mock_psutil.cpu_percent.return_value = 30.0
-
-            alerts = await degraded_check(config, mock_aiohttp_session)
-
-        assert any("98.0%" in str(a) for a in alerts)
-
-    async def test_degraded_check_fires_on_critical_cpu(
-        self, config_yaml_file, mock_aiohttp_session
-    ):
-        from agent_mon.agent import degraded_check
-        from agent_mon.config import Config
-
-        config = Config.from_file(config_yaml_file)
-
-        with patch("agent_mon.agent.psutil") as mock_psutil:
-            mock_psutil.disk_partitions.return_value = []
-            mock_psutil.virtual_memory.return_value = MagicMock(percent=50.0)
-            mock_psutil.cpu_percent.return_value = 99.0
-
-            alerts = await degraded_check(config, mock_aiohttp_session)
-
-        assert any("99.0%" in str(a) for a in alerts)
-
-    async def test_degraded_check_always_sends_meta_alert(
-        self, config_yaml_file, mock_aiohttp_session
-    ):
-        from agent_mon.agent import degraded_check
-        from agent_mon.config import Config
-
-        config = Config.from_file(config_yaml_file)
-
-        with patch("agent_mon.agent.psutil") as mock_psutil:
-            mock_psutil.disk_partitions.return_value = []
-            mock_psutil.virtual_memory.return_value = MagicMock(percent=50.0)
-            mock_psutil.cpu_percent.return_value = 30.0
-
-            alerts = await degraded_check(config, mock_aiohttp_session)
-
-        # Even with no threshold violations, the degraded-mode meta-alert fires
         assert any("degraded" in str(a).lower() for a in alerts)
 
-    async def test_degraded_check_no_false_positive_below_thresholds(
-        self, config_yaml_file, mock_aiohttp_session
-    ):
-        from agent_mon.agent import degraded_check
+    async def test_degraded_check_detects_disk_critical(self, config_yaml_file):
         from agent_mon.config import Config
 
         config = Config.from_file(config_yaml_file)
 
-        with patch("agent_mon.agent.psutil") as mock_psutil:
-            mock_psutil.disk_partitions.return_value = []
-            mock_psutil.virtual_memory.return_value = MagicMock(percent=50.0)
-            mock_psutil.cpu_percent.return_value = 30.0
+        with patch("agent_mon.agent.subprocess") as mock_subprocess:
+            mock_subprocess.TimeoutExpired = TimeoutError
 
-            alerts = await degraded_check(config, mock_aiohttp_session)
+            def mock_run(cmd, **kwargs):
+                result = MagicMock()
+                result.returncode = 0
+                if cmd[0] == "df":
+                    result.stdout = (
+                        "Filesystem      Size  Used Avail Use% Mounted on\n"
+                        "/dev/sda1       100G   97G    3G  97% /\n"
+                    )
+                elif cmd[0] == "free":
+                    result.stdout = (
+                        "              total        used        free\n"
+                        "Mem:          16000        8000        8000\n"
+                    )
+                elif cmd[0] == "uptime":
+                    result.stdout = " 12:00:00 up 10 days, load average: 0.5, 0.3, 0.2"
+                else:
+                    result.stdout = ""
+                return result
 
-        # Only the meta-alert, no threshold alerts
-        threshold_alerts = [a for a in alerts if "degraded" not in str(a).lower()]
-        assert len(threshold_alerts) == 0
+            mock_subprocess.run.side_effect = mock_run
+
+            alerts = await degraded_check(config)
+
+        # Should have a disk alert
+        assert any("97%" in str(a) for a in alerts)

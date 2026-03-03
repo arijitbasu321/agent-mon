@@ -1,4 +1,4 @@
-"""PreToolUse hooks: tool allowlist guard and Docker remediation guard."""
+"""PreToolUse hooks: bash deny-list guard and Docker remediation guard."""
 
 from __future__ import annotations
 
@@ -16,46 +16,31 @@ class HookResult:
 
 
 # ---------------------------------------------------------------------------
-# Allowed tools set
+# Bash deny-list guard
 # ---------------------------------------------------------------------------
 
-ALLOWED_TOOLS = {
-    # System monitoring (in-process)
-    "mcp__monitoring__get_cpu_info",
-    "mcp__monitoring__get_memory_info",
-    "mcp__monitoring__get_disk_info",
-    "mcp__monitoring__get_io_info",
-    "mcp__monitoring__get_process_list",
-    "mcp__monitoring__get_security_info",
-    "mcp__monitoring__get_system_issues",
-    # Alerting (in-process)
-    "mcp__monitoring__send_alert",
-    "mcp__monitoring__get_alert_history",
-    # Remediation — process/service (in-process)
-    "mcp__monitoring__kill_process",
-    "mcp__monitoring__restart_service",
-    # Docker (external MCP)
-    "mcp__docker__list_containers",
-    "mcp__docker__inspect_container",
-    "mcp__docker__container_logs",
-    "mcp__docker__container_stats",
-    "mcp__docker__restart_container",
-    "mcp__docker__start_container",
-    "mcp__docker__stop_container",
-    "mcp__docker__list_images",
-}
+def bash_denylist_guard(
+    tool_name: str,
+    tool_input: dict,
+    *,
+    config: Config,
+) -> HookResult:
+    """Block bash commands that match any entry in the deny list.
 
+    Uses case-insensitive substring matching.
+    """
+    command = tool_input.get("command", "")
+    if not command:
+        return HookResult(decision="allow")
 
-# ---------------------------------------------------------------------------
-# Tool allowlist guard (catch-all)
-# ---------------------------------------------------------------------------
+    command_lower = command.lower()
+    for pattern in config.bash.deny_list:
+        if pattern.lower() in command_lower:
+            return HookResult(
+                decision="deny",
+                reason=f"Command blocked by deny-list: matches '{pattern}'",
+            )
 
-def tool_allowlist_guard(tool_name: str, tool_input: dict) -> HookResult:
-    if tool_name not in ALLOWED_TOOLS:
-        return HookResult(
-            decision="deny",
-            reason=f"Tool {tool_name} is not permitted",
-        )
     return HookResult(decision="allow")
 
 

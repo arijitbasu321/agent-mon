@@ -17,8 +17,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        required=True,
-        help="Path to config.yaml",
+        default="/etc/agent-mon/config.yaml",
+        help="Path to config.yaml (default: /etc/agent-mon/config.yaml)",
     )
 
     mode = parser.add_mutually_exclusive_group()

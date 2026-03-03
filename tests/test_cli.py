@@ -1,12 +1,11 @@
 """Tests for the CLI entry point and argument parsing.
 
 Covers:
-- --config flag is required
+- --config flag defaults to /etc/agent-mon/config.yaml
 - --once flag triggers one-shot mode
 - --interactive flag triggers interactive mode
 - Default mode is daemon (continuous)
 - Missing config file error
-- Argument parsing edge cases
 """
 
 import sys
@@ -24,9 +23,9 @@ class TestArgParsing:
         args = parse_args(["--config", "/etc/agent-mon/config.yaml"])
         assert args.config == "/etc/agent-mon/config.yaml"
 
-    def test_config_is_required(self):
-        with pytest.raises(SystemExit):
-            parse_args([])
+    def test_config_default(self):
+        args = parse_args([])
+        assert args.config == "/etc/agent-mon/config.yaml"
 
     def test_once_flag(self):
         args = parse_args(["--once", "--config", "config.yaml"])
@@ -42,7 +41,6 @@ class TestArgParsing:
         assert args.interactive is False
 
     def test_once_and_interactive_mutually_exclusive(self):
-        """Cannot use --once and --interactive together."""
         with pytest.raises(SystemExit):
             parse_args(["--once", "--interactive", "--config", "config.yaml"])
 

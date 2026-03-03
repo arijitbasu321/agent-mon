@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------
+# agent-mon configuration (v2)
+# ---------------------------------------------------------------
+
+# ---------------------------------------------------------------
+# General
+# ---------------------------------------------------------------
+check_interval: 300                   # seconds between checks (min: 30)
+model: claude-sonnet-4-6              # claude-sonnet-4-6 | claude-opus-4-6
+max_turns: 25                         # max agent tool calls per cycle
+
+# ---------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------
+heartbeat:
+  enabled: true
+  interval: 3600                      # seconds (default: 1 hour, min: 60)
+
+# ---------------------------------------------------------------
+# Watched Processes
+# ---------------------------------------------------------------
+# If a watched process stops, agent-mon will restart it.
+# It will NEVER kill a process.
+watched_processes:
+  - name: my-api-server
+    restart_command: "systemctl restart my-api-server"
+
+# ---------------------------------------------------------------
+# Watched Containers
+# ---------------------------------------------------------------
+watched_containers:
+  - nginx
+  - redis
+
+# ---------------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------------
+alerts:
+  log_file: /var/log/agent-mon.log
+  email:
+    enabled: true
+    from: "agent-mon@yourdomain.com"
+    to: ["ops@company.com"]
+    min_severity: warning             # only email for warning + critical
+    dedup_window_minutes: 15          # suppress duplicate emails
+
+# ---------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------
+docker:
+  enabled: true                       # set false if no Docker on this host
+
+# ---------------------------------------------------------------
+# Remediation
+# ---------------------------------------------------------------
+remediation:
+  enabled: true
+  allowed_restart_containers: [nginx, redis]
+  allowed_restart_services:
+    - nginx
+    - docker
+  max_restart_attempts: 3             # per target per hour
+
+# ---------------------------------------------------------------
+# Bash Safety
+# ---------------------------------------------------------------
+bash:
+  deny_list:
+    - "rm -rf /"
+    - "rm -rf /*"
+    - "shutdown"
+    - "reboot"
+    - "poweroff"
+    - "halt"
+    - "init 0"
+    - "init 6"
+    - "mkfs"
+    - "dd if="
+    - ":(){ :|:& };:"
+    - "fdisk"
+    - "parted"
+    - "wipefs"
+    - "> /dev/sd"
+    - "chmod -R 777 /"
+    - "chown -R"
+    - "userdel"
+    - "groupdel"
+    - "passwd"
+    - "iptables -F"
+    - "iptables -X"
+
+# ---------------------------------------------------------------
+# Memory (ChromaDB)
+# ---------------------------------------------------------------
+memory:
+  enabled: true
+  path: /var/lib/agent-mon/memory
+  collection_name: agent_mon_memory
+  max_results: 5

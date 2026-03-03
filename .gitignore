@@ -5,3 +5,7 @@ dist/
 build/
 .pytest_cache/
 *.egg
+
+# Secrets — never commit API keys
+.env
+.env.*

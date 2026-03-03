@@ -1,0 +1,33 @@
+[Unit]
+Description=agent-mon - AI-powered system monitoring agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent-mon --config /etc/agent-mon/config.yaml
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=300
+TimeoutStopSec=60
+
+# Environment
+EnvironmentFile=/etc/agent-mon/env
+
+# Security hardening
+User=agent-mon
+Group=agent-mon
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log /var/lib/agent-mon
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-mon
+
+[Install]
+WantedBy=multi-user.target
