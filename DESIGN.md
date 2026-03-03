@@ -16,49 +16,53 @@ and decide on remediation actions contextually.
 ## High-Level Architecture
 
 ```
+                        ┌──────────────┐
+                        │   systemd    │
+                        │  (manages    │
+                        │   process)   │
+                        └──────┬───────┘
+                               │ starts/stops/restarts
+                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                        agent-mon                            │
 │                                                             │
 │  ┌───────────┐    ┌──────────────┐    ┌──────────────────┐  │
-│  │           │    │              │    │                  │  │
-│  │  Scheduler│───▶│  Agent Loop  │───▶│  Alert Dispatch  │  │
-│  │  (daemon) │    │  (Claude)    │    │  (stdout/file/   │  │
-│  │           │    │              │    │   webhook)       │  │
+│  │           │    │              │    │  Alert Dispatch   │  │
+│  │  Scheduler│───▶│  Agent Loop  │───▶│  - stdout        │  │
+│  │  (daemon) │    │  (Claude)    │    │  - JSON log      │  │
+│  │           │    │              │    │  - Email (Resend) │  │
 │  └───────────┘    └──────┬───────┘    └──────────────────┘  │
 │                          │                                  │
 │                          │ calls tools                      │
-│                          ▼                                  │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │              MCP Tool Server (in-process)            │   │
-│  │                                                      │   │
-│  │  ┌──────────┐ ┌──────────┐ ┌───────────┐            │   │
-│  │  │ cpu_info │ │ mem_info │ │ disk_info │            │   │
-│  │  └──────────┘ └──────────┘ └───────────┘            │   │
-│  │  ┌──────────┐ ┌──────────┐ ┌───────────┐            │   │
-│  │  │  io_info │ │proc_list │ │docker_list│            │   │
-│  │  └──────────┘ └──────────┘ └───────────┘            │   │
-│  │  ┌───────────────┐ ┌────────────────┐                │   │
-│  │  │ security_check│ │ system_issues  │                │   │
-│  │  └───────────────┘ └────────────────┘                │   │
-│  │                                                      │   │
-│  │  ── Remediation Tools ──                             │   │
-│  │  ┌──────────────┐ ┌─────────────────┐                │   │
-│  │  │ kill_process │ │restart_container│                │   │
-│  │  └──────────────┘ └─────────────────┘                │   │
-│  │  ┌───────────────┐                                   │   │
-│  │  │restart_service│                                   │   │
-│  │  └───────────────┘                                   │   │
-│  │                                                      │   │
-│  │  ── Alert Tools ──                                   │   │
-│  │  ┌──────────┐ ┌──────────────┐                       │   │
-│  │  │send_alert│ │get_alert_log │                       │   │
-│  │  └──────────┘ └──────────────┘                       │   │
-│  └──────────────────────────────────────────────────────┘   │
+│                   ┌──────┴──────┐                           │
+│                   │             │                           │
+│                   ▼             ▼                           │
+│  ┌────────────────────┐ ┌────────────────────────────┐      │
+│  │  SDK MCP Server    │ │  Docker MCP Server         │      │
+│  │  (in-process)      │ │  (external, stdio)         │      │
+│  │                    │ │                            │      │
+│  │  -- Monitoring --  │ │  list_containers           │      │
+│  │  cpu_info          │ │  inspect_container         │      │
+│  │  mem_info          │ │  container_logs            │      │
+│  │  disk_info         │ │  start/stop/restart        │      │
+│  │  io_info           │ │  container_stats           │      │
+│  │  proc_list         │ │  list_images               │      │
+│  │  security_check    │ └────────────────────────────┘      │
+│  │  system_issues     │                                     │
+│  │                    │                                     │
+│  │  -- Remediation -- │                                     │
+│  │  kill_process      │                                     │
+│  │  restart_service   │                                     │
+│  │                    │                                     │
+│  │  -- Alerting --    │                                     │
+│  │  send_alert        │                                     │
+│  │  get_alert_history │                                     │
+│  └────────────────────┘                                     │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │                    Config (YAML)                      │   │
-│  │  thresholds, alert channels, remediation rules,       │   │
-│  │  check interval, model selection                      │   │
+│  │  thresholds, alert channels (Resend), remediation     │   │
+│  │  rules, check interval, model selection               │   │
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -128,15 +132,38 @@ Returns:
   - Highlights zombie/defunct processes
 ```
 
-#### 1f. `get_docker_containers`
+#### 1f. Docker Monitoring — via Docker MCP Server (external)
 
-Lists Docker containers and their status. Uses the `docker` Python SDK.
+Docker monitoring is handled by the **official Docker MCP server** (`mcp/docker`)
+running as an external stdio-based MCP server. This provides all Docker tools
+out of the box:
 
 ```
-Returns:
-  - Per container: id, name, image, status, health, ports, restart_count
-  - Flags containers in "exited" or "unhealthy" state
-  - Container resource stats (cpu%, mem%) for running containers
+Tools provided by Docker MCP:
+  - list_containers    — list all containers with status, health, ports
+  - inspect_container  — detailed container metadata
+  - container_logs     — tail container logs (useful for diagnosing crashes)
+  - container_stats    — live CPU/memory/network stats per container
+  - start_container    — start a stopped container
+  - stop_container     — stop a running container
+  - restart_container  — restart a container (used for remediation)
+  - list_images        — list available images
+
+Docker remediation (restart) also goes through this MCP server, gated by
+the allow-list in config (enforced in a PreToolUse hook, see Safety section).
+```
+
+Configuration in the SDK:
+```python
+mcp_servers={
+    "monitoring": monitoring_server,        # in-process SDK MCP
+    "docker": {                             # external Docker MCP
+        "command": "docker",
+        "args": ["run", "-i", "--rm",
+                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                 "mcp/docker"],
+    },
+}
 ```
 
 #### 1g. `get_security_info`
@@ -179,13 +206,18 @@ Returns: Success/failure message
 Guard:  Config must list this PID's process name in allowed_kill_targets
 ```
 
-#### 2b. `restart_container`
+#### 2b. `restart_container` — via Docker MCP
+
+Container restart is handled by the Docker MCP server's `restart_container` tool.
+Access is gated by a **PreToolUse hook** that checks the container name against
+`config.remediation.allowed_restart_containers` before allowing execution.
 
 ```
-Input:  container_id_or_name (str)
-Action: docker restart <container>
-Returns: New container status after restart
-Guard:  Config must list container name in allowed_restart_containers
+Hook logic (PreToolUse on mcp__docker__restart_container):
+  1. Extract container name from tool input
+  2. Check against allowed_restart_containers in config
+  3. Check rate limit (max_restart_attempts per hour)
+  4. Return "allow" or "deny" with reason
 ```
 
 #### 2c. `restart_service`
@@ -203,11 +235,35 @@ Guard:  Config must list service in allowed_restart_services
 
 ```
 Input:  severity ("info" | "warning" | "critical"), title (str), message (str)
-Action: Dispatches alert to configured channels:
-        - stdout (always)
-        - JSON log file (always)
-        - Webhook URL (if configured)
-Returns: Confirmation of delivery
+Action: Dispatches alert to ALL configured channels:
+        1. stdout (always) — colored by severity
+        2. JSON log file (always) — appended to alerts.json
+        3. Email via Resend (if configured) — for warning and critical only
+Returns: Confirmation of delivery per channel
+```
+
+**Email via Resend**:
+- Uses the Resend REST API (`https://api.resend.com/emails`)
+- API key provided via `RESEND_API_KEY` environment variable
+- Email is sent via `aiohttp` POST (no extra SDK dependency)
+- Subject line includes severity and hostname: `[CRITICAL] agent-mon@prod-1: Disk full`
+- Body is plain text with full alert details
+- Only `warning` and `critical` alerts trigger email (configurable)
+- Rate limit: max 1 email per unique alert title per 15 minutes (dedup)
+
+```python
+# Resend API call (inside send_alert tool)
+async with aiohttp.ClientSession() as session:
+    await session.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {resend_api_key}"},
+        json={
+            "from": config.alerts.email_from,      # e.g. "agent-mon@yourdomain.com"
+            "to": config.alerts.email_to,           # e.g. ["ops@company.com"]
+            "subject": f"[{severity.upper()}] agent-mon@{hostname}: {title}",
+            "text": message,
+        },
+    )
 ```
 
 #### 3b. `get_alert_history`
@@ -309,25 +365,51 @@ options = ClaudeAgentOptions(
     max_turns=15,                     # Cap per check cycle
     permission_mode="bypassPermissions",  # Unattended operation
     system_prompt=SYSTEM_PROMPT,
-    mcp_servers={"monitoring": monitoring_server},
+    mcp_servers={
+        # In-process: system monitoring + alerting + remediation
+        "monitoring": monitoring_server,
+        # External: Docker MCP server (containers, images, logs)
+        "docker": {
+            "command": "docker",
+            "args": ["run", "-i", "--rm",
+                     "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                     "mcp/docker"],
+        },
+    },
     allowed_tools=[
-        # Monitoring
+        # System monitoring (in-process)
         "mcp__monitoring__get_cpu_info",
         "mcp__monitoring__get_memory_info",
         "mcp__monitoring__get_disk_info",
         "mcp__monitoring__get_io_info",
         "mcp__monitoring__get_process_list",
-        "mcp__monitoring__get_docker_containers",
         "mcp__monitoring__get_security_info",
         "mcp__monitoring__get_system_issues",
-        # Alerting
+        # Alerting (in-process)
         "mcp__monitoring__send_alert",
         "mcp__monitoring__get_alert_history",
-        # Remediation
+        # Remediation — process/service (in-process)
         "mcp__monitoring__kill_process",
-        "mcp__monitoring__restart_container",
         "mcp__monitoring__restart_service",
+        # Docker (external MCP)
+        "mcp__docker__list_containers",
+        "mcp__docker__inspect_container",
+        "mcp__docker__container_logs",
+        "mcp__docker__container_stats",
+        "mcp__docker__restart_container",
+        "mcp__docker__start_container",
+        "mcp__docker__stop_container",
+        "mcp__docker__list_images",
     ],
+    hooks={
+        # Gate Docker remediation via allow-list
+        "PreToolUse": [
+            HookMatcher(
+                matcher="mcp__docker__restart_container|mcp__docker__stop_container",
+                hooks=[docker_remediation_guard],
+            )
+        ],
+    },
 )
 ```
 
@@ -357,9 +439,23 @@ thresholds:
 
 # Alert channels
 alerts:
-  log_file: /var/log/agent-mon/alerts.json
-  webhook_url: null                          # Optional: Slack/PagerDuty webhook
   stdout: true
+  log_file: /var/log/agent-mon/alerts.json
+
+  # Email alerts via Resend
+  email:
+    enabled: true
+    from: "agent-mon@yourdomain.com"
+    to:
+      - "ops@company.com"
+    min_severity: warning           # Only email for warning and critical
+    dedup_window_minutes: 15        # Suppress duplicate emails within this window
+  # RESEND_API_KEY must be set as environment variable
+
+# Docker MCP server
+docker:
+  enabled: true
+  # The Docker MCP server runs as an external stdio process
 
 # Remediation policy — only these targets can be auto-remediated
 remediation:
@@ -376,6 +472,13 @@ remediation:
   max_restart_attempts: 3         # Per container/service per hour
 ```
 
+### Environment Variables
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...       # Required: Claude API key
+RESEND_API_KEY=re_...              # Required for email alerts
+```
+
 ---
 
 ## File Structure
@@ -383,54 +486,125 @@ remediation:
 ```
 agent-mon/
 ├── pyproject.toml
-├── config.yaml                     # Default configuration
+├── config.yaml                       # Default configuration
+├── agent-mon.service                  # Systemd unit file
 ├── agent_mon/
 │   ├── __init__.py
-│   ├── cli.py                      # Entry point & argument parsing
-│   ├── agent.py                    # Agent loop, scheduler, SDK integration
-│   ├── config.py                   # Config loading & validation
+│   ├── cli.py                        # Entry point & argument parsing
+│   ├── agent.py                      # Agent loop, scheduler, SDK integration
+│   ├── config.py                     # Config loading & validation
 │   ├── tools/
-│   │   ├── __init__.py             # Creates the MCP server, registers all tools
-│   │   ├── cpu.py                  # get_cpu_info
-│   │   ├── memory.py               # get_memory_info
-│   │   ├── disk.py                 # get_disk_info
-│   │   ├── io.py                   # get_io_info
-│   │   ├── processes.py            # get_process_list
-│   │   ├── docker.py               # get_docker_containers
-│   │   ├── security.py             # get_security_info
-│   │   ├── system.py               # get_system_issues
-│   │   ├── remediation.py          # kill_process, restart_container, restart_service
-│   │   └── alerts.py               # send_alert, get_alert_history
-│   └── prompt.py                   # System prompt template builder
+│   │   ├── __init__.py               # Creates SDK MCP server, registers all tools
+│   │   ├── cpu.py                    # get_cpu_info
+│   │   ├── memory.py                 # get_memory_info
+│   │   ├── disk.py                   # get_disk_info
+│   │   ├── io.py                     # get_io_info
+│   │   ├── processes.py              # get_process_list
+│   │   ├── security.py               # get_security_info
+│   │   ├── system.py                 # get_system_issues
+│   │   ├── remediation.py            # kill_process, restart_service
+│   │   └── alerts.py                 # send_alert (stdout + log + Resend email),
+│   │                                 # get_alert_history
+│   └── prompt.py                     # System prompt template builder
 └── README.md
 ```
 
+Note: Docker monitoring and container remediation are handled by the external
+Docker MCP server (`mcp/docker`), so no `docker.py` tool file is needed.
+
 ---
 
-## Execution Modes
+## Systemd Service
 
-### 1. Daemon Mode (default)
+agent-mon runs as a systemd service. This provides automatic start on boot,
+restart on crash, structured logging via journald, and standard service
+management (`systemctl start/stop/restart/status`).
 
-Runs continuously, executing checks at `check_interval`.
+### Unit File (`agent-mon.service`)
 
-```bash
-agent-mon --config config.yaml
+```ini
+[Unit]
+Description=agent-mon - AI-powered system monitoring agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent-mon --config /etc/agent-mon/config.yaml
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Environment
+EnvironmentFile=/etc/agent-mon/env
+# Contains:
+#   ANTHROPIC_API_KEY=sk-ant-...
+#   RESEND_API_KEY=re_...
+
+# Security hardening
+User=agent-mon
+Group=agent-mon
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/agent-mon
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-mon
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-### 2. One-Shot Mode
-
-Runs a single check and exits. Useful for cron jobs or CI.
+### Installation
 
 ```bash
+# Install the package
+pip install .
+
+# Create service user
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin agent-mon
+sudo usermod -aG docker agent-mon   # For Docker MCP access
+
+# Create directories
+sudo mkdir -p /etc/agent-mon /var/log/agent-mon
+sudo chown agent-mon:agent-mon /var/log/agent-mon
+
+# Copy config and environment
+sudo cp config.yaml /etc/agent-mon/config.yaml
+sudo cp agent-mon.env /etc/agent-mon/env
+sudo chmod 600 /etc/agent-mon/env   # Protect API keys
+
+# Install and enable service
+sudo cp agent-mon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agent-mon
+```
+
+### Management
+
+```bash
+sudo systemctl start agent-mon       # Start
+sudo systemctl stop agent-mon        # Stop
+sudo systemctl restart agent-mon     # Restart
+sudo systemctl status agent-mon      # Status
+sudo journalctl -u agent-mon -f      # Live logs
+sudo journalctl -u agent-mon --since "1 hour ago"  # Recent logs
+```
+
+### CLI Modes (outside of systemd)
+
+The CLI also supports direct invocation for debugging and one-off checks:
+
+```bash
+# One-shot mode: run a single check and exit
 agent-mon --once --config config.yaml
-```
 
-### 3. Interactive Mode
-
-Opens an interactive session where you can ask the agent questions about
-system health or request specific checks.
-
-```bash
+# Interactive mode: ask the agent questions
 agent-mon --interactive --config config.yaml
 ```
 
@@ -438,24 +612,38 @@ agent-mon --interactive --config config.yaml
 
 ## Safety & Guards
 
-1. **Remediation allow-lists**: Tools refuse to act on targets not in config.
-   The LLM cannot bypass this — the Python tool function checks the config
-   before executing.
+1. **Remediation allow-lists**: In-process tools (`kill_process`, `restart_service`)
+   refuse to act on targets not in config. The LLM cannot bypass this — the Python
+   tool function checks the config before executing.
 
-2. **Rate limiting**: Remediation tools track restart counts per hour. If
-   `max_restart_attempts` is exceeded, the tool refuses and alerts instead.
+2. **Docker MCP gating via PreToolUse hook**: Since the Docker MCP server doesn't
+   know about our allow-lists, a `PreToolUse` hook intercepts
+   `mcp__docker__restart_container` and `mcp__docker__stop_container` calls. The
+   hook extracts the container name, checks it against
+   `config.remediation.allowed_restart_containers`, and returns `deny` if not
+   allowed. This runs in Python before the tool executes — the LLM cannot bypass it.
 
-3. **max_turns cap**: Each check cycle is limited to prevent runaway token usage.
+3. **Rate limiting**: Remediation tools track restart counts per hour. If
+   `max_restart_attempts` is exceeded, the tool/hook refuses and alerts instead.
 
-4. **Model selection**: Uses `haiku` by default for cost efficiency. Can be
+4. **max_turns cap**: Each check cycle is limited to prevent runaway token usage.
+
+5. **Model selection**: Uses `haiku` by default for cost efficiency. Can be
    switched to `sonnet` or `opus` for deeper analysis on demand.
 
-5. **No destructive built-in tools**: The agent has NO access to `Bash`, `Write`,
+6. **No destructive built-in tools**: The agent has NO access to `Bash`, `Write`,
    `Edit`, or other file-manipulation tools. It can only use the custom MCP tools
-   defined above.
+   and the Docker MCP server.
 
-6. **Audit log**: Every alert and remediation action is logged to the JSON log
+7. **Audit log**: Every alert and remediation action is logged to the JSON log
    file with timestamps, for post-incident review.
+
+8. **Systemd hardening**: The service runs as a dedicated `agent-mon` user with
+   `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=true`, and restricted
+   write paths. Only `/var/log/agent-mon` is writable.
+
+9. **Email dedup**: Resend emails are deduplicated per alert title within a
+   configurable window (default 15 min) to prevent inbox flooding.
 
 ---
 
@@ -474,10 +662,24 @@ Claude retains context about the system's baseline.
 
 ---
 
+## Dependencies
+
+```
+# pyproject.toml [project.dependencies]
+claude-agent-sdk           # Agent SDK
+psutil                     # CPU, memory, disk, I/O, process metrics
+aiohttp                    # Async HTTP for Resend API
+pyyaml                     # Config file parsing
+```
+
+No Docker Python SDK needed — Docker is handled by the external MCP server.
+
+---
+
 ## Future Extensions (Not in v0.1)
 
 - **Multi-host**: Agent queries remote hosts via SSH MCP tools
 - **Metrics history**: Store metrics in SQLite for trend analysis
 - **Dashboard**: Simple web UI showing current status and alert history
-- **Escalation**: If remediation fails, page on-call via PagerDuty
+- **Slack/PagerDuty**: Additional alert channels beyond email
 - **Custom checks**: User-defined check scripts loaded as additional tools
