@@ -134,6 +134,8 @@ class TestKillProcess:
         import psutil
 
         with patch("agent_mon.tools.remediation.psutil") as mock_psutil:
+            # Preserve real exception class so 'except psutil.NoSuchProcess' works
+            mock_psutil.NoSuchProcess = psutil.NoSuchProcess
             mock_psutil.Process.side_effect = psutil.NoSuchProcess(pid=9999)
 
             result = kill_process(

@@ -60,6 +60,7 @@ class TestMainEntryPoint:
 
         mock_daemon = MagicMock()
         mock_daemon.run = AsyncMock()
+        mock_daemon._run_check_cycle = AsyncMock()
         mock_daemon_cls.return_value = mock_daemon
 
         with patch("sys.argv", ["agent-mon", "--config", str(config_path), "--once"]):
@@ -96,6 +97,7 @@ class TestMainEntryPoint:
 
         mock_daemon = MagicMock()
         mock_daemon.run = AsyncMock()
+        mock_daemon._run_check_cycle = AsyncMock()
         mock_daemon_cls.return_value = mock_daemon
 
         with patch("sys.argv", ["agent-mon", "--config", str(config_path), "--once"]):

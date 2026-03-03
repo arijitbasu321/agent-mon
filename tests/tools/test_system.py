@@ -9,6 +9,7 @@ Covers:
 - Handles missing/unavailable subsystems
 """
 
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,6 +24,9 @@ class TestGetSystemIssues:
     def mock_deps(self):
         with patch("agent_mon.tools.system.psutil") as mock_psutil, \
              patch("agent_mon.tools.system.subprocess") as mock_subprocess:
+
+            # Preserve real exception class so 'except subprocess.TimeoutExpired' works
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
             # Uptime via psutil.boot_time
             mock_psutil.boot_time.return_value = 1709000000.0
@@ -64,6 +68,8 @@ class TestGetSystemIssues:
 
     def test_reports_oom_events(self, mock_deps):
         with patch("agent_mon.tools.system.subprocess") as mock_sub:
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+
             def run_handler(cmd, *args, **kwargs):
                 result = MagicMock()
                 result.returncode = 0
@@ -86,6 +92,8 @@ class TestGetSystemIssues:
 
     def test_reports_failed_systemd_units(self, mock_deps):
         with patch("agent_mon.tools.system.subprocess") as mock_sub:
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+
             def run_handler(cmd, *args, **kwargs):
                 result = MagicMock()
                 result.returncode = 0
@@ -104,6 +112,8 @@ class TestGetSystemIssues:
 
     def test_reports_ntp_not_synced(self, mock_deps):
         with patch("agent_mon.tools.system.subprocess") as mock_sub:
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+
             def run_handler(cmd, *args, **kwargs):
                 result = MagicMock()
                 result.returncode = 0
@@ -123,6 +133,8 @@ class TestGetSystemIssues:
 
     def test_handles_systemctl_not_available(self, mock_deps):
         with patch("agent_mon.tools.system.subprocess") as mock_sub:
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+
             def run_handler(cmd, *args, **kwargs):
                 cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
                 if "systemctl" in cmd_str:
@@ -140,6 +152,8 @@ class TestGetSystemIssues:
 
     def test_handles_dmesg_permission_error(self, mock_deps):
         with patch("agent_mon.tools.system.subprocess") as mock_sub:
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+
             def run_handler(cmd, *args, **kwargs):
                 cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
                 if "dmesg" in cmd_str:
