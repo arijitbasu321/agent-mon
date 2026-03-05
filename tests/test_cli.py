@@ -2,8 +2,8 @@
 
 Covers:
 - --config flag defaults to /etc/agent-mon/config.yaml
-- --once flag triggers one-shot mode
-- --interactive flag triggers interactive mode
+- --once flag triggers one-shot mode via run_once()
+- --interactive flag gives error (not yet implemented)
 - Default mode is daemon (continuous)
 - Missing config file error
 """
@@ -58,7 +58,7 @@ class TestMainEntryPoint:
 
         mock_daemon = MagicMock()
         mock_daemon.run = AsyncMock()
-        mock_daemon._run_check_cycle = AsyncMock()
+        mock_daemon.run_once = AsyncMock()
         mock_daemon_cls.return_value = mock_daemon
 
         with patch("sys.argv", ["agent-mon", "--config", str(config_path), "--once"]):
@@ -95,10 +95,44 @@ class TestMainEntryPoint:
 
         mock_daemon = MagicMock()
         mock_daemon.run = AsyncMock()
-        mock_daemon._run_check_cycle = AsyncMock()
+        mock_daemon.run_once = AsyncMock()
         mock_daemon_cls.return_value = mock_daemon
 
         with patch("sys.argv", ["agent-mon", "--config", str(config_path), "--once"]):
             main()
 
         mock_config.validate_env.assert_called_once()
+
+    @patch("agent_mon.cli.Config")
+    @patch("agent_mon.cli.AgentDaemon")
+    def test_once_calls_run_once(self, mock_daemon_cls, mock_config_cls, tmp_path):
+        """H7: --once uses run_once() which initializes properly."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("check_interval: 300\n")
+        mock_config = MagicMock()
+        mock_config_cls.from_file.return_value = mock_config
+
+        mock_daemon = MagicMock()
+        mock_daemon.run_once = AsyncMock()
+        mock_daemon_cls.return_value = mock_daemon
+
+        with patch("sys.argv", ["agent-mon", "--config", str(config_path), "--once"]):
+            main()
+
+        mock_daemon.run_once.assert_awaited_once()
+
+    @patch("agent_mon.cli.Config")
+    def test_interactive_exits_with_error(self, mock_config_cls, tmp_path, capsys):
+        """M8: --interactive gives an error instead of silently doing nothing."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("check_interval: 300\n")
+        mock_config = MagicMock()
+        mock_config_cls.from_file.return_value = mock_config
+
+        with patch("sys.argv", ["agent-mon", "--config", str(config_path), "--interactive"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "not yet implemented" in captured.err

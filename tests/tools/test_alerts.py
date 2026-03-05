@@ -1,22 +1,25 @@
-"""Tests for send_alert and get_alert_history tools.
+"""Tests for send_alert, get_alert_history, and secret sanitization.
 
 Covers:
 - send_alert appends plain text line to log file
 - send_alert sends email for warning/critical via Resend
 - send_alert skips email for info severity
-- send_alert deduplicates emails within window
-- send_alert handles Resend API errors gracefully
-- get_alert_history returns recent alerts from log
+- send_alert deduplicates emails within window (M1: on original title)
+- send_alert handles Resend API errors gracefully (L6: reads error body)
+- send_alert sanitizes secrets before logging and emailing
+- send_alert rotates log files (H4)
+- get_alert_history returns recent alerts from log (H3: efficient read)
+- sanitize_secrets replaces known secret patterns (H1: expanded)
+- _email_dedup pruning (L2)
 """
 
-import json
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_mon.tools.alerts import AlertManager
+from agent_mon.tools.alerts import AlertManager, sanitize_secrets
 
 
 # ===========================================================================
@@ -152,6 +155,21 @@ class TestSendAlertDedup:
         lines = [l for l in content.strip().split("\n") if l]
         assert len(lines) == 2
 
+    async def test_dedup_on_original_title_not_sanitized(self, alert_manager):
+        """M1: different secrets should produce different dedup keys."""
+        await alert_manager.send_alert(
+            "warning",
+            "Found key sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaa",
+            "Leaked",
+        )
+        await alert_manager.send_alert(
+            "warning",
+            "Found key sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbb",
+            "Leaked",
+        )
+        # Both should send because original titles differ
+        assert alert_manager.http_session.post.await_count == 2
+
 
 class TestSendAlertErrorHandling:
     """Test graceful handling of email delivery failures."""
@@ -169,12 +187,15 @@ class TestSendAlertErrorHandling:
     async def test_handles_resend_api_error(self, alert_manager, alerts_log_file):
         response = AsyncMock()
         response.status = 500
+        response.text = AsyncMock(return_value='{"error": "internal"}')
         alert_manager.http_session.post = AsyncMock(return_value=response)
 
-        await alert_manager.send_alert("critical", "Disk full", "/ at 98%")
+        result = await alert_manager.send_alert("critical", "Disk full", "/ at 98%")
 
         content = alerts_log_file.read_text()
         assert "Disk full" in content
+        # L6: error body included
+        assert "500" in result
 
     async def test_handles_network_error(self, alert_manager, alerts_log_file):
         import aiohttp
@@ -198,7 +219,7 @@ class TestSendAlertErrorHandling:
 
 
 # ===========================================================================
-# get_alert_history
+# get_alert_history (H3: efficient read)
 # ===========================================================================
 
 
@@ -257,3 +278,224 @@ class TestGetAlertHistory:
         assert "High CPU" in history
         assert "Disk full" in history
         assert "Check complete" in history
+
+
+# ===========================================================================
+# Log rotation (H4)
+# ===========================================================================
+
+
+class TestLogRotation:
+    """Test size-based log rotation."""
+
+    @pytest.fixture
+    def alert_manager(self, config_yaml_file, alerts_log_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.alerts.log_file = str(alerts_log_file)
+        return AlertManager(config)
+
+    def test_does_not_rotate_small_log(self, alert_manager, alerts_log_file):
+        alerts_log_file.write_text("small content\n")
+        alert_manager._rotate_log_if_needed()
+        assert alerts_log_file.exists()
+        assert not alerts_log_file.with_suffix(".1").exists()
+
+    def test_rotates_large_log(self, alert_manager, alerts_log_file):
+        # Write more than _MAX_LOG_SIZE
+        with patch("agent_mon.tools.alerts._MAX_LOG_SIZE", 10):
+            alerts_log_file.write_text("x" * 20)
+            alert_manager._rotate_log_if_needed()
+
+        assert alerts_log_file.with_suffix(".1").exists()
+        assert not alerts_log_file.exists()
+
+    def test_chains_rotations(self, alert_manager, alerts_log_file):
+        with patch("agent_mon.tools.alerts._MAX_LOG_SIZE", 10):
+            # First rotation
+            alerts_log_file.write_text("first" * 10)
+            alert_manager._rotate_log_if_needed()
+            assert alerts_log_file.with_suffix(".1").exists()
+
+            # Write new content and rotate again
+            alerts_log_file.write_text("second" * 10)
+            alert_manager._rotate_log_if_needed()
+            assert alerts_log_file.with_suffix(".1").exists()
+            assert alerts_log_file.with_suffix(".2").exists()
+
+
+# ===========================================================================
+# Secret sanitizer (H1: expanded patterns)
+# ===========================================================================
+
+
+class TestSecretSanitizer:
+    """Test the sanitize_secrets function."""
+
+    def test_redacts_anthropic_key(self):
+        text = "Key: sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+        assert "[REDACTED]" in sanitize_secrets(text)
+        assert "sk-ant-" not in sanitize_secrets(text)
+
+    def test_redacts_aws_access_key(self):
+        text = "AWS key: AKIAIOSFODNN7EXAMPLE"
+        assert "[REDACTED]" in sanitize_secrets(text)
+        assert "AKIA" not in sanitize_secrets(text)
+
+    def test_redacts_github_pat(self):
+        for prefix in ["ghp_", "gho_", "ghs_"]:
+            text = f"Token: {prefix}{'a' * 36}"
+            result = sanitize_secrets(text)
+            assert "[REDACTED]" in result
+            assert prefix not in result
+
+    def test_redacts_gitlab_pat(self):
+        text = "Token: glpat-abcdefghijklmnopqrstuvwxyz"
+        assert "[REDACTED]" in sanitize_secrets(text)
+        assert "glpat-" not in sanitize_secrets(text)
+
+    def test_redacts_bearer_token(self):
+        text = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+        assert "eyJ" not in result
+
+    def test_redacts_password_assignment(self):
+        text = "password=supersecret123"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+        assert "supersecret123" not in result
+
+    def test_redacts_secret_assignment(self):
+        text = "secret=my_top_secret_value"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+
+    def test_redacts_api_key_assignment(self):
+        text = "api_key=sk-proj-abc123def456"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+
+    def test_redacts_resend_key(self):
+        text = "RESEND_API_KEY=re_abcdefghijklmnopqrstuvwxyz"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+        assert "re_abcdef" not in result
+
+    def test_redacts_slack_tokens(self):
+        for prefix in ["xoxb-", "xoxp-"]:
+            text = f"Token: {prefix}{'1234567890-' * 3}abcdef"
+            result = sanitize_secrets(text)
+            assert "[REDACTED]" in result
+
+    def test_redacts_openai_style_key(self):
+        text = "Key: sk-proj-abcdefghijklmnopqrstuvwxyz"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+
+    def test_preserves_normal_text(self):
+        text = "CPU at 92%, disk at 85%, nginx is running"
+        assert sanitize_secrets(text) == text
+
+    def test_multiple_secrets_in_one_string(self):
+        text = (
+            "Found sk-ant-api03-abcdefghijklmnopqrstuvwxyz "
+            "and AKIAIOSFODNN7EXAMPLE in env"
+        )
+        result = sanitize_secrets(text)
+        assert result.count("[REDACTED]") == 2
+        assert "sk-ant-" not in result
+        assert "AKIA" not in result
+
+    # H1: expanded pattern tests
+    def test_redacts_database_url(self):
+        text = "DATABASE_URL=postgres://user:pass@host:5432/db"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+        assert "postgres://" not in result
+
+    def test_redacts_auth_token(self):
+        text = "auth_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+
+    def test_redacts_client_secret(self):
+        text = "client_secret=super_secret_value_123"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+
+    def test_redacts_db_password(self):
+        text = "db_password=hunter2"
+        result = sanitize_secrets(text)
+        assert "[REDACTED]" in result
+
+
+class TestSendAlertSecretSanitization:
+    """Test that send_alert sanitizes secrets."""
+
+    @pytest.fixture
+    def alert_manager(self, config_yaml_file, alerts_log_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.alerts.log_file = str(alerts_log_file)
+        manager = AlertManager(config)
+        manager.http_session = AsyncMock()
+        response = AsyncMock()
+        response.status = 200
+        manager.http_session.post = AsyncMock(return_value=response)
+        return manager
+
+    async def test_secrets_redacted_in_log(self, alert_manager, alerts_log_file):
+        await alert_manager.send_alert(
+            "warning",
+            "Found key sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            "Leaked in config file",
+        )
+        content = alerts_log_file.read_text()
+        assert "sk-ant-" not in content
+        assert "[REDACTED]" in content
+
+    async def test_secrets_redacted_in_email(self, alert_manager):
+        await alert_manager.send_alert(
+            "warning",
+            "Found API key",
+            "Key AKIAIOSFODNN7EXAMPLE was exposed",
+        )
+        call_kwargs = alert_manager.http_session.post.call_args
+        body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+        assert "AKIA" not in body["text"]
+        assert "[REDACTED]" in body["text"]
+
+
+# ===========================================================================
+# Dedup pruning (L2)
+# ===========================================================================
+
+
+class TestDedupPruning:
+    """Test that _email_dedup dict is pruned."""
+
+    @pytest.fixture
+    def alert_manager(self, config_yaml_file, alerts_log_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.alerts.log_file = str(alerts_log_file)
+        config.alerts.email.dedup_window_minutes = 1
+        manager = AlertManager(config)
+        return manager
+
+    def test_expired_entries_are_pruned(self, alert_manager):
+        # Manually add an old entry
+        alert_manager._email_dedup["old_title"] = time.time() - 120  # 2 min ago
+        alert_manager._email_dedup["new_title"] = time.time()
+
+        # Trigger pruning via _should_send_email
+        alert_manager._should_send_email("test_title")
+
+        # Old entry should be pruned
+        assert "old_title" not in alert_manager._email_dedup
+        # New entry should remain
+        assert "new_title" in alert_manager._email_dedup

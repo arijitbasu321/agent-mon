@@ -1,67 +1,57 @@
-"""System prompt template builder for bash-first agent."""
+"""System prompt builders for orchestrator and investigator agents."""
 
 from __future__ import annotations
 
 from agent_mon.config import Config
 
 
-def build_system_prompt(config: Config, *, memory_context: str = "") -> str:
-    """Build the system prompt for the monitoring agent."""
+def build_orchestrator_prompt(
+    config: Config,
+    *,
+    last_cycle_summary: str = "",
+    watched_context: str = "",
+) -> str:
+    """Build the system prompt for the monitoring orchestrator agent."""
     sections = [
-        "You are a system monitoring agent with bash access. Your job is to",
-        "investigate the health of this system, detect issues, alert on problems,",
-        "and take corrective action when possible.",
+        "You are a system monitoring orchestrator. Your job is to keep this",
+        "system healthy by scanning broadly, identifying issues, and dispatching",
+        "deep investigations for each one.",
         "",
-        "## Workflow",
+        "## Goal",
         "",
-        "1. **INVESTIGATE** -- Use bash to gather system state. Useful commands:",
-        "   - `ps aux`, `top -bn1`, `htop -t` (processes, CPU)",
-        "   - `free -m`, `vmstat 1 3` (memory)",
-        "   - `df -h`, `du -sh /var/log/*` (disk)",
-        "   - `journalctl -p err --since '1 hour ago'` (recent errors)",
-        "   - `ss -tlnp`, `netstat -tlnp` (listening ports)",
-        "   - `systemctl list-units --failed` (failed services)",
-        "   - `uptime`, `cat /proc/loadavg` (load)",
-        "   - `dmesg --level=err,warn -T | tail -20` (kernel messages)",
-        "",
-        "2. **DIAGNOSE** -- Correlate signals across metrics. Think about root",
-        "   causes, not just symptoms. High CPU + high I/O + a specific process",
-        "   may mean a backup cron is running, not an incident.",
-        "",
-        "3. **ALERT** -- Call `send_alert` for every issue found:",
-        "   - **critical**: Service down, disk >95% full, OOM, security breach",
-        "   - **warning**: High resource usage, unhealthy containers, failed units",
-        "   - **info**: Notable but non-urgent observations",
-        "",
-        "4. **REMEDIATE** -- Fix issues when allowed:",
+        "1. Use bash to scan system health: processes, memory, disk, load,",
+        "   failed services, journal errors, container status, network.",
+        "2. For each issue found, call `investigate_issue` with a description.",
+        "   Dispatch investigations sequentially -- after each returns, re-verify",
+        "   whether the next issue is still active before investigating it.",
+        "3. After all investigations complete, send ONE consolidated `send_alert`",
+        "   covering everything found and done this cycle.",
+        "4. Store a cycle summary via `store_memory` so the next cycle has context.",
     ]
 
+    # Remediation policy
+    sections += [
+        "",
+        "## Remediation Policy",
+    ]
     if config.remediation.enabled:
         if config.remediation.allowed_restart_services:
             services = ", ".join(config.remediation.allowed_restart_services)
             sections.append(
-                f"   - Restart failed systemd services via bash (allowed: {services})"
+                f"- Allowed to restart systemd services: {services}"
             )
         if config.remediation.allowed_restart_containers:
             containers = ", ".join(config.remediation.allowed_restart_containers)
             sections.append(
-                f"   - Restart unhealthy containers via Docker tools (allowed: {containers})"
+                f"- Allowed to restart containers: {containers}"
             )
         sections.append(
-            "   After remediation, re-check and confirm the fix worked."
+            f"- Max restart attempts per target: {config.remediation.max_restart_attempts}"
         )
     else:
         sections.append(
-            "   Remediation is disabled. Suggest manual intervention for issues found."
+            "Remediation is disabled. Report issues but do not attempt fixes."
         )
-
-    sections += [
-        "",
-        "5. **REMEMBER** -- Call `store_memory` with what you observed and did,",
-        "   so future cycles can learn from past issues.",
-        "",
-        "6. **SUMMARIZE** -- End with a brief status summary.",
-    ]
 
     # Watched processes
     if config.watched_processes:
@@ -73,9 +63,6 @@ def build_system_prompt(config: Config, *, memory_context: str = "") -> str:
             sections.append(
                 f"- **{wp.name}**: restart with `{wp.restart_command}`"
             )
-        sections.append(
-            "Check if these are running. If not, restart them using the configured command."
-        )
 
     # Watched containers
     if config.watched_containers:
@@ -83,27 +70,102 @@ def build_system_prompt(config: Config, *, memory_context: str = "") -> str:
         sections += [
             "",
             f"## Watched Containers: {names}",
-            "Monitor these containers. If unhealthy or stopped, restart via Docker tools.",
+            "Check these containers are running and healthy. Investigate any that are not.",
         ]
 
     # Rules
     sections += [
         "",
         "## Rules",
-        "- NEVER kill any process. Processes are observed and restarted, never killed.",
-        "- Always alert BEFORE attempting remediation.",
+        "- NEVER leak secrets, API keys, or passwords in alerts or memory.",
+        "- NEVER kill any process.",
+        "- NEVER run destructive commands (rm -rf, mkfs, dd, etc.).",
         "- Never remediate anything not in the allowed lists.",
-        "- If unsure, alert as warning and suggest manual intervention.",
         "- Reference specific PIDs, container names, and metrics in alerts.",
-        "- Do not run destructive commands (rm -rf, mkfs, dd, shutdown, etc.).",
     ]
 
-    # Memory context
-    if memory_context and memory_context != "No past observations in memory.":
+    # Last cycle summary
+    if last_cycle_summary:
         sections += [
             "",
-            "## Recent Memory (past observations)",
-            memory_context,
+            "## Last Cycle Summary",
+            last_cycle_summary,
+        ]
+
+    # Watched service context from memory
+    if watched_context and watched_context != "No past observations in memory.":
+        sections += [
+            "",
+            "## Recent Memory (watched services)",
+            watched_context,
         ]
 
     return "\n".join(sections)
+
+
+def build_investigator_prompt(config: Config, issue_description: str) -> str:
+    """Build the system prompt for an investigator sub-agent."""
+    sections = [
+        "You are investigating a specific system issue. Your job is to deeply",
+        "investigate, diagnose, and if possible remediate this issue.",
+        "",
+        f"## Issue to Investigate",
+        f"{issue_description}",
+        "",
+        "## Instructions",
+        "",
+        "1. Use bash freely to investigate: check logs (`journalctl`, `docker logs`,",
+        "   application logs), correlate metrics (CPU, memory, disk, network),",
+        "   inspect processes and containers.",
+        "2. Use `query_memory` to check for similar past issues and what resolved them.",
+        "3. Diagnose the root cause, not just the symptom.",
+        "4. If remediation is allowed for this target, fix it and verify the fix worked.",
+        "5. Report back a concise summary: what you found, what you did, and the outcome.",
+    ]
+
+    # Remediation policy
+    sections += [
+        "",
+        "## Remediation Policy",
+    ]
+    if config.remediation.enabled:
+        if config.remediation.allowed_restart_services:
+            services = ", ".join(config.remediation.allowed_restart_services)
+            sections.append(
+                f"- Allowed to restart systemd services: {services}"
+            )
+        if config.remediation.allowed_restart_containers:
+            containers = ", ".join(config.remediation.allowed_restart_containers)
+            sections.append(
+                f"- Allowed to restart containers: {containers}"
+            )
+        sections.append(
+            f"- Max restart attempts per target: {config.remediation.max_restart_attempts}"
+        )
+    else:
+        sections.append(
+            "Remediation is disabled. Diagnose and report but do not attempt fixes."
+        )
+
+    # Rules
+    sections += [
+        "",
+        "## Rules",
+        "- NEVER leak secrets, API keys, or passwords in your report.",
+        "- NEVER kill any process.",
+        "- NEVER run destructive commands (rm -rf, mkfs, dd, etc.).",
+        "- Never remediate anything not in the allowed lists.",
+    ]
+
+    return "\n".join(sections)
+
+
+def build_system_prompt(config: Config, *, memory_context: str = "") -> str:
+    """Backward-compatible wrapper for interactive mode.
+
+    Delegates to build_orchestrator_prompt with memory_context as watched_context.
+    """
+    return build_orchestrator_prompt(
+        config,
+        watched_context=memory_context,
+    )

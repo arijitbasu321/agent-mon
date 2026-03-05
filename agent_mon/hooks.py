@@ -16,6 +16,52 @@ class HookResult:
 
 
 # ---------------------------------------------------------------------------
+# Rate limiter (H2: instance-owned, not global mutable state)
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Per-container restart rate limiter."""
+
+    def __init__(self):
+        self._restart_history: dict[str, list[float]] = defaultdict(list)
+
+    def check_and_record(self, container: str, max_attempts: int) -> tuple[bool, str]:
+        """Check if a restart is allowed, and record it if so.
+
+        Returns (allowed, reason) tuple.
+        """
+        now = time.monotonic()
+        hour_ago = now - 3600
+        # Prune old entries
+        self._restart_history[container] = [
+            t for t in self._restart_history[container] if t > hour_ago
+        ]
+
+        if len(self._restart_history[container]) >= max_attempts:
+            return False, (
+                f"Rate limit exceeded: {container} has been restarted "
+                f"{len(self._restart_history[container])} times in the last hour "
+                f"(max: {max_attempts})"
+            )
+
+        self._restart_history[container].append(now)
+        return True, ""
+
+    def reset(self) -> None:
+        """Reset all rate limit state."""
+        self._restart_history.clear()
+
+
+# Module-level default for backward compat / tests
+_default_rate_limiter = RateLimiter()
+
+
+def reset_rate_limits() -> None:
+    """Reset rate limit state. Used in tests."""
+    _default_rate_limiter.reset()
+
+
+# ---------------------------------------------------------------------------
 # Bash deny-list guard
 # ---------------------------------------------------------------------------
 
@@ -48,20 +94,12 @@ def bash_denylist_guard(
 # Docker remediation guard with rate limiting
 # ---------------------------------------------------------------------------
 
-# Per-container restart timestamps: container_name -> list of timestamps
-_restart_history: dict[str, list[float]] = defaultdict(list)
-
-
-def reset_rate_limits() -> None:
-    """Reset rate limit state. Used in tests."""
-    _restart_history.clear()
-
-
 def docker_remediation_guard(
     tool_name: str,
     tool_input: dict,
     *,
     config: Config,
+    rate_limiter: RateLimiter | None = None,
 ) -> HookResult:
     if not config.remediation.enabled:
         return HookResult(
@@ -76,23 +114,12 @@ def docker_remediation_guard(
             reason=f"Container '{container}' is not in the allowed restart list",
         )
 
-    # Rate limiting
-    now = time.monotonic()
-    hour_ago = now - 3600
-    # Prune old entries
-    _restart_history[container] = [
-        t for t in _restart_history[container] if t > hour_ago
-    ]
+    # Rate limiting -- use provided limiter or module-level default
+    limiter = rate_limiter or _default_rate_limiter
+    allowed, reason = limiter.check_and_record(
+        container, config.remediation.max_restart_attempts,
+    )
+    if not allowed:
+        return HookResult(decision="deny", reason=reason)
 
-    if len(_restart_history[container]) >= config.remediation.max_restart_attempts:
-        return HookResult(
-            decision="deny",
-            reason=(
-                f"Rate limit exceeded: {container} has been restarted "
-                f"{len(_restart_history[container])} times in the last hour "
-                f"(max: {config.remediation.max_restart_attempts})"
-            ),
-        )
-
-    _restart_history[container].append(now)
     return HookResult(decision="allow")

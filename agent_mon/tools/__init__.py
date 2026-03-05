@@ -1,25 +1,27 @@
 """MCP server setup and tool registration.
 
-Creates an in-process MCP server with alert and memory tools.
+Creates tool sets for orchestrator and investigator agents.
 """
 
 from __future__ import annotations
 
+from typing import Awaitable, Callable
+
 from agent_mon.config import Config
 from agent_mon.memory import MemoryStore
-from agent_mon.tools.alerts import AlertManager
+from agent_mon.tools.alerts import AlertManager, sanitize_secrets
 
 
-def create_monitoring_tools(
+def create_orchestrator_tools(
     config: Config,
     alert_manager: AlertManager,
     memory_store: MemoryStore | None = None,
+    investigate_fn: Callable[[str], Awaitable[str]] | None = None,
 ) -> list[dict]:
-    """Create the list of tool definitions for the agent.
+    """Create the tool set for the orchestrator agent.
 
-    Returns a list of tool dicts compatible with the Claude Agent SDK.
-    The actual tool handlers are closures that capture the alert_manager
-    and memory_store instances.
+    Orchestrator gets: send_alert, get_alert_history, store_memory, investigate_issue.
+    It does NOT get query_memory (that's for investigators).
     """
     tools = []
 
@@ -45,7 +47,7 @@ def create_monitoring_tools(
     tools.append({"function": send_alert, "name": "send_alert"})
     tools.append({"function": get_alert_history, "name": "get_alert_history"})
 
-    # --- Memory tools ---
+    # --- Memory store tool (H1: sanitize secrets before storing) ---
     if memory_store is not None and config.memory.enabled:
         def store_memory(observation: str, action: str, outcome: str) -> str:
             """Store an observation/action/outcome in persistent memory.
@@ -55,9 +57,41 @@ def create_monitoring_tools(
                 action: What action was taken (e.g., 'Restarted nginx container').
                 outcome: What happened after the action (e.g., 'CPU dropped to 15%').
             """
+            observation = sanitize_secrets(observation)
+            action = sanitize_secrets(action)
+            outcome = sanitize_secrets(outcome)
             entry_id = memory_store.store(observation, action, outcome)
             return f"Memory stored (id: {entry_id})"
 
+        tools.append({"function": store_memory, "name": "store_memory"})
+
+    # --- Investigate tool (C1: now async) ---
+    if investigate_fn is not None:
+        async def investigate_issue(description: str) -> str:
+            """Dispatch a sub-agent to deeply investigate a specific issue.
+
+            Args:
+                description: Description of the issue to investigate.
+            """
+            return await investigate_fn(description)
+
+        tools.append({"function": investigate_issue, "name": "investigate_issue"})
+
+    return tools
+
+
+def create_investigator_tools(
+    config: Config,
+    memory_store: MemoryStore | None = None,
+) -> list[dict]:
+    """Create the tool set for an investigator sub-agent.
+
+    Investigator gets: query_memory.
+    It does NOT get send_alert or store_memory (orchestrator handles those).
+    """
+    tools = []
+
+    if memory_store is not None and config.memory.enabled:
         def query_memory(query: str, n_results: int = 5) -> str:
             """Search past observations by semantic similarity.
 
@@ -67,7 +101,20 @@ def create_monitoring_tools(
             """
             return memory_store.query(query, n_results)
 
-        tools.append({"function": store_memory, "name": "store_memory"})
         tools.append({"function": query_memory, "name": "query_memory"})
 
     return tools
+
+
+def create_monitoring_tools(
+    config: Config,
+    alert_manager: AlertManager,
+    memory_store: MemoryStore | None = None,
+) -> list[dict]:
+    """Backward-compatible factory for interactive mode.
+
+    Returns the full orchestrator tool set (without investigate_issue).
+    """
+    return create_orchestrator_tools(
+        config, alert_manager, memory_store, investigate_fn=None,
+    )

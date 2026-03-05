@@ -45,6 +45,7 @@ class MemoryStore:
         outcome: str,
         *,
         cycle_id: str | None = None,
+        entry_type: str = "observation",
     ) -> str:
         """Persist an observation/action/outcome tuple. Returns entry ID."""
         if self._collection is None:
@@ -63,10 +64,15 @@ class MemoryStore:
                 "outcome": outcome,
                 "timestamp": timestamp,
                 "cycle_id": cycle_id or "",
+                "entry_type": entry_type,
             }],
         )
 
         logger.debug("Stored memory entry %s", entry_id)
+
+        # M5: evict old entries if over limit
+        self._evict_if_needed()
+
         return entry_id
 
     def query(self, query_text: str, n_results: int | None = None) -> str:
@@ -98,3 +104,75 @@ class MemoryStore:
             entries.append(f"[{ts}] {doc}")
 
         return "\n".join(entries)
+
+    def get_last_cycle_summary(self) -> str:
+        """Return the most recent cycle summary, or empty string if none."""
+        if self._collection is None:
+            raise RuntimeError("MemoryStore not initialized -- call initialize() first")
+
+        try:
+            if self._collection.count() == 0:
+                return ""
+
+            results = self._collection.get(
+                where={"entry_type": "cycle_summary"},
+            )
+
+            if not results["documents"]:
+                return ""
+
+            # Find the most recent by timestamp
+            best_doc = None
+            best_ts = ""
+            for doc, metadata in zip(results["documents"], results["metadatas"]):
+                ts = metadata.get("timestamp", "")
+                if ts > best_ts:
+                    best_ts = ts
+                    best_doc = doc
+
+            return best_doc or ""
+        except Exception:
+            logger.debug("Failed to get last cycle summary", exc_info=True)
+            return ""
+
+    def query_by_services(self, service_names: list[str]) -> str:
+        """Query memory for observations related to specific services."""
+        if self._collection is None:
+            raise RuntimeError("MemoryStore not initialized -- call initialize() first")
+
+        if not service_names:
+            return ""
+
+        try:
+            query_text = " ".join(service_names)
+            return self.query(query_text)
+        except Exception:
+            logger.debug("Failed to query by services", exc_info=True)
+            return ""
+
+    # M5: evict oldest entries when over max_entries limit
+    def _evict_if_needed(self) -> None:
+        """Remove oldest entries if collection exceeds max_entries."""
+        if self._collection is None:
+            return
+
+        count = self._collection.count()
+        if count <= self.config.max_entries:
+            return
+
+        try:
+            all_entries = self._collection.get()
+            if not all_entries["ids"]:
+                return
+
+            # Sort by timestamp (oldest first)
+            pairs = list(zip(all_entries["ids"], all_entries["metadatas"]))
+            pairs.sort(key=lambda p: p[1].get("timestamp", ""))
+
+            excess = count - self.config.max_entries
+            ids_to_delete = [p[0] for p in pairs[:excess]]
+            if ids_to_delete:
+                self._collection.delete(ids=ids_to_delete)
+                logger.info("Evicted %d old memory entries", len(ids_to_delete))
+        except Exception:
+            logger.debug("Failed to evict old entries", exc_info=True)

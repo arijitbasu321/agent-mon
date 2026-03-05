@@ -68,6 +68,7 @@ class MemoryConfig:
     path: str = "/var/lib/agent-mon/memory"
     collection_name: str = "agent_mon_memory"
     max_results: int = 5
+    max_entries: int = 10000
 
 
 @dataclass
@@ -116,7 +117,7 @@ class Config:
         if not isinstance(check_interval, (int, float)) or check_interval < 30:
             raise ConfigError("check_interval must be >= 30 seconds")
 
-        max_turns = raw.get("max_turns", 25)
+        max_turns = raw.get("max_turns", 100)
         if not isinstance(max_turns, int) or max_turns <= 0:
             raise ConfigError("max_turns must be a positive integer")
 
@@ -286,6 +287,7 @@ class Config:
             path=raw.get("path", "/var/lib/agent-mon/memory"),
             collection_name=raw.get("collection_name", "agent_mon_memory"),
             max_results=raw.get("max_results", 5),
+            max_entries=raw.get("max_entries", 10000),
         )
 
     # ------------------------------------------------------------------

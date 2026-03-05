@@ -7,6 +7,8 @@ Covers:
 - Degraded mode fallback (subprocess-based, no psutil)
 - Check cycle error handling
 - Heartbeat loop
+- Orchestrator/Investigator architecture
+- Pre-cycle memory injection
 """
 
 import asyncio
@@ -182,6 +184,15 @@ class TestAgentDaemonInit:
         assert daemon.http_session is None
         assert daemon.check_in_progress is False
 
+    def test_daemon_has_rate_limiter(self, config_yaml_file):
+        """H2: daemon owns its own RateLimiter instance."""
+        from agent_mon.config import Config
+        from agent_mon.hooks import RateLimiter
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        assert isinstance(daemon.rate_limiter, RateLimiter)
+
 
 class TestAgentDaemonShutdown:
     """Test graceful shutdown behavior."""
@@ -262,6 +273,45 @@ class TestAgentDaemonCheckCycle:
         assert daemon_with_config.check_in_progress is False
 
 
+class TestAgentDaemonInitialize:
+    """Test the _initialize method (H7)."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        return AgentDaemon(config)
+
+    async def test_initialize_creates_http_session(self, daemon):
+        await daemon._initialize()
+        assert daemon.http_session is not None
+        await daemon._cleanup()
+
+    async def test_initialize_sets_alert_manager_session(self, daemon):
+        await daemon._initialize()
+        assert daemon.alert_manager.http_session is daemon.http_session
+        await daemon._cleanup()
+
+
+class TestRunOnce:
+    """Test the run_once method (H7)."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        return AgentDaemon(config)
+
+    async def test_run_once_initializes_and_cleans_up(self, daemon):
+        daemon._run_check_cycle = AsyncMock()
+        await daemon.run_once()
+        daemon._run_check_cycle.assert_awaited_once()
+        # Session should be closed after cleanup
+        assert daemon.http_session is None or daemon.http_session.closed
+
+
 class TestHeartbeatLoop:
     """Test the heartbeat loop."""
 
@@ -289,6 +339,30 @@ class TestHeartbeatLoop:
 
         await daemon_with_heartbeat._run_heartbeat_loop()
         assert send_count == 1
+
+
+class TestHeartbeatEmptyKey:
+    """Test H5: heartbeat skips when RESEND_API_KEY is empty."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        daemon.http_session = AsyncMock()
+        return daemon
+
+    async def test_skips_when_resend_key_empty(self, daemon, monkeypatch):
+        monkeypatch.setenv("RESEND_API_KEY", "")
+        await daemon._send_heartbeat()
+        # Should not call http_session.post
+        daemon.http_session.post.assert_not_awaited()
+
+    async def test_skips_when_resend_key_missing(self, daemon, monkeypatch):
+        monkeypatch.delenv("RESEND_API_KEY", raising=False)
+        await daemon._send_heartbeat()
+        daemon.http_session.post.assert_not_awaited()
 
 
 class TestDegradedMode:
@@ -344,3 +418,280 @@ class TestDegradedMode:
 
         # Should have a disk alert
         assert any("97%" in str(a) for a in alerts)
+
+
+class TestCircuitBreakerH6:
+    """Test H6: PermissionError/MemoryError don't trip the circuit breaker."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        daemon.http_session = AsyncMock()
+        return daemon
+
+    async def test_permission_error_does_not_trip_breaker(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(side_effect=PermissionError("no access"))
+            MockClient.return_value = mock_instance
+
+            with pytest.raises(PermissionError):
+                await daemon._run_check_cycle()
+
+        assert daemon.circuit_breaker.state == CircuitBreaker.CLOSED
+        assert daemon.circuit_breaker.consecutive_failures == 0
+
+    async def test_api_error_trips_breaker(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(side_effect=ConnectionError("API down"))
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+        assert daemon.circuit_breaker.consecutive_failures == 1
+
+
+# ===========================================================================
+# Orchestrator / Investigator architecture tests
+# ===========================================================================
+
+
+class TestOrchestratorFlow:
+    """Test that _run_check_cycle creates orchestrator with correct setup."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        daemon.http_session = AsyncMock()
+        return daemon
+
+    async def test_cycle_creates_client_with_orchestrator_prompt(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+            # Check the system_prompt contains orchestrator identity
+            call_kwargs = MockClient.call_args
+            prompt = call_kwargs.kwargs.get("system_prompt") or call_kwargs[1].get("system_prompt", "")
+            assert "orchestrator" in prompt.lower()
+
+    async def test_cycle_passes_investigate_issue_tool(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+            call_kwargs = MockClient.call_args
+            tools = call_kwargs.kwargs.get("tools") or call_kwargs[1].get("tools", [])
+            tool_names = [t["name"] for t in tools]
+            assert "investigate_issue" in tool_names
+
+    async def test_cycle_passes_send_alert_and_store_memory(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+            call_kwargs = MockClient.call_args
+            tools = call_kwargs.kwargs.get("tools") or call_kwargs[1].get("tools", [])
+            tool_names = [t["name"] for t in tools]
+            assert "send_alert" in tool_names
+            assert "store_memory" in tool_names
+
+    async def test_cycle_does_not_pass_query_memory(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+            call_kwargs = MockClient.call_args
+            tools = call_kwargs.kwargs.get("tools") or call_kwargs[1].get("tools", [])
+            tool_names = [t["name"] for t in tools]
+            assert "query_memory" not in tool_names
+
+
+class TestInvestigatorDispatch:
+    """Test _run_investigator creates sub-agent with correct setup."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        return daemon
+
+    async def test_investigator_creates_sub_agent(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(return_value="Investigation complete")
+            MockClient.return_value = mock_instance
+
+            result = await daemon._run_investigator("nginx is down")
+
+            MockClient.assert_called_once()
+            assert "Investigation complete" in result
+
+    async def test_investigator_passes_query_memory_tool(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(return_value="done")
+            MockClient.return_value = mock_instance
+
+            await daemon._run_investigator("nginx is down")
+
+            call_kwargs = MockClient.call_args
+            tools = call_kwargs.kwargs.get("tools") or call_kwargs[1].get("tools", [])
+            tool_names = [t["name"] for t in tools]
+            assert "query_memory" in tool_names
+
+    async def test_investigator_does_not_pass_send_alert(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(return_value="done")
+            MockClient.return_value = mock_instance
+
+            await daemon._run_investigator("disk full")
+
+            call_kwargs = MockClient.call_args
+            tools = call_kwargs.kwargs.get("tools") or call_kwargs[1].get("tools", [])
+            tool_names = [t["name"] for t in tools]
+            assert "send_alert" not in tool_names
+            assert "store_memory" not in tool_names
+
+    async def test_investigator_includes_issue_in_prompt(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(return_value="done")
+            MockClient.return_value = mock_instance
+
+            await daemon._run_investigator("redis memory spike")
+
+            call_kwargs = MockClient.call_args
+            prompt = call_kwargs.kwargs.get("system_prompt") or call_kwargs[1].get("system_prompt", "")
+            assert "redis memory spike" in prompt
+
+    async def test_investigator_max_turns_capped_at_30(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(return_value="done")
+            MockClient.return_value = mock_instance
+
+            await daemon._run_investigator("test issue")
+
+            call_kwargs = MockClient.call_args
+            max_turns = call_kwargs.kwargs.get("max_turns") or call_kwargs[1].get("max_turns")
+            assert max_turns <= 30
+
+    async def test_investigator_gets_same_hooks(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock(return_value="done")
+            MockClient.return_value = mock_instance
+
+            await daemon._run_investigator("test issue")
+
+            call_kwargs = MockClient.call_args
+            hooks = call_kwargs.kwargs.get("hooks") or call_kwargs[1].get("hooks", {})
+            assert "bash" in hooks
+            assert "docker" in hooks
+
+    async def test_investigator_error_returns_error_string(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            MockClient.side_effect = RuntimeError("API down")
+
+            result = await daemon._run_investigator("test issue")
+
+            assert "failed" in result.lower()
+
+    async def test_investigator_timeout_returns_timeout_string(self, daemon):
+        """M4: test wall-clock timeout on investigator."""
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+
+            async def slow_run(*args, **kwargs):
+                await asyncio.sleep(999)
+
+            mock_instance.run = slow_run
+            MockClient.return_value = mock_instance
+
+            with patch("agent_mon.agent._INVESTIGATOR_TIMEOUT", 0.01):
+                result = await daemon._run_investigator("test issue")
+
+            assert "timed out" in result.lower()
+
+
+class TestPreCycleMemory:
+    """Test that _run_check_cycle queries memory before running."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        daemon.http_session = AsyncMock()
+        # Set up mock memory store
+        daemon.memory_store = MagicMock()
+        daemon.memory_store.get_last_cycle_summary = MagicMock(
+            return_value="Last cycle: all healthy"
+        )
+        daemon.memory_store.query_by_services = MagicMock(
+            return_value="nginx was restarted yesterday"
+        )
+        return daemon
+
+    async def test_queries_last_cycle_summary(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+            daemon.memory_store.get_last_cycle_summary.assert_called_once()
+
+    async def test_queries_watched_service_context(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+            daemon.memory_store.query_by_services.assert_called_once()
+            # Check service names include watched processes + containers
+            call_args = daemon.memory_store.query_by_services.call_args
+            service_names = call_args[0][0]
+            assert "my-api-server" in service_names
+            assert "nginx" in service_names
+            assert "redis" in service_names
+
+    async def test_injects_both_into_orchestrator_prompt(self, daemon):
+        with patch("claude_agent_sdk.ClaudeSDKClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.run = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            await daemon._run_check_cycle()
+
+            call_kwargs = MockClient.call_args
+            prompt = call_kwargs.kwargs.get("system_prompt") or call_kwargs[1].get("system_prompt", "")
+            assert "Last cycle: all healthy" in prompt
+            assert "nginx was restarted yesterday" in prompt

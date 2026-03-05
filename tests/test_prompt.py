@@ -1,157 +1,187 @@
-"""Tests for system prompt template builder.
+"""Tests for orchestrator and investigator prompt builders.
 
 Covers:
-- Prompt includes 6-step workflow (INVESTIGATE, DIAGNOSE, ALERT, REMEDIATE, REMEMBER, SUMMARIZE)
-- Prompt suggests bash commands
-- Prompt includes remediation policy and allowed targets
-- Prompt includes rules
-- Prompt includes watched processes and containers
-- Prompt includes memory context when provided
-- No thresholds in prompt (agent uses judgment)
+- Orchestrator prompt: identity, investigate_issue, consolidated alert,
+  secrets warning, remediation policy, watched processes/containers,
+  last cycle summary injection, watched context injection
+- Investigator prompt: identity, issue description, query_memory,
+  remediation policy, secrets warning, report instruction
+- Backward-compatible build_system_prompt wrapper
 """
 
 import pytest
 
 from agent_mon.config import Config
-from agent_mon.prompt import build_system_prompt
+from agent_mon.prompt import (
+    build_orchestrator_prompt,
+    build_investigator_prompt,
+    build_system_prompt,
+)
 
 
-class TestSystemPromptWorkflow:
-    """Test that the system prompt includes the 6-step workflow."""
-
-    @pytest.fixture
-    def prompt(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        return build_system_prompt(config)
-
-    def test_includes_investigate_step(self, prompt):
-        assert "INVESTIGATE" in prompt
-
-    def test_includes_diagnose_step(self, prompt):
-        assert "DIAGNOSE" in prompt
-
-    def test_includes_alert_step(self, prompt):
-        assert "ALERT" in prompt
-
-    def test_includes_remediate_step(self, prompt):
-        assert "REMEDIATE" in prompt
-
-    def test_includes_remember_step(self, prompt):
-        assert "REMEMBER" in prompt
-
-    def test_includes_summarize_step(self, prompt):
-        assert "SUMMARIZE" in prompt
-
-    def test_includes_severity_levels(self, prompt):
-        assert "critical" in prompt.lower()
-        assert "warning" in prompt.lower()
-        assert "info" in prompt.lower()
-
-
-class TestSystemPromptBashCommands:
-    """Test that bash commands are suggested in the prompt."""
+class TestOrchestratorPrompt:
+    """Test the orchestrator system prompt."""
 
     @pytest.fixture
-    def prompt(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        return build_system_prompt(config)
+    def config(self, config_yaml_file):
+        return Config.from_file(config_yaml_file)
 
-    def test_suggests_ps(self, prompt):
-        assert "ps" in prompt
+    @pytest.fixture
+    def prompt(self, config):
+        return build_orchestrator_prompt(config)
 
-    def test_suggests_df(self, prompt):
-        assert "df" in prompt
+    def test_includes_orchestrator_identity(self, prompt):
+        assert "orchestrator" in prompt.lower()
 
-    def test_suggests_free(self, prompt):
-        assert "free" in prompt
+    def test_includes_investigate_issue_reference(self, prompt):
+        assert "investigate_issue" in prompt
 
-    def test_suggests_journalctl(self, prompt):
-        assert "journalctl" in prompt
+    def test_includes_consolidated_alert_instruction(self, prompt):
+        assert "send_alert" in prompt
 
-    def test_suggests_systemctl(self, prompt):
-        assert "systemctl" in prompt
+    def test_includes_store_memory_instruction(self, prompt):
+        assert "store_memory" in prompt
 
+    def test_includes_secrets_warning(self, prompt):
+        assert "secret" in prompt.lower()
 
-class TestSystemPromptRemediation:
-    """Test remediation policy is reflected in the prompt."""
+    def test_includes_never_kill_rule(self, prompt):
+        assert "never kill" in prompt.lower()
 
-    def test_includes_allowed_containers(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        prompt = build_system_prompt(config)
+    def test_includes_no_destructive_commands_rule(self, prompt):
+        assert "destructive" in prompt.lower()
+
+    def test_includes_remediation_policy(self, config):
+        prompt = build_orchestrator_prompt(config)
+        assert "Remediation Policy" in prompt
+
+    def test_includes_allowed_services(self, config):
+        prompt = build_orchestrator_prompt(config)
         assert "nginx" in prompt
+
+    def test_includes_allowed_containers(self, config):
+        prompt = build_orchestrator_prompt(config)
         assert "redis" in prompt
         assert "postgres" in prompt
 
-    def test_includes_allowed_services(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        prompt = build_system_prompt(config)
-        assert "docker" in prompt
-
-    def test_includes_alert_before_remediate_rule(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        prompt = build_system_prompt(config)
-        assert "alert" in prompt.lower() and "before" in prompt.lower()
-
-    def test_remediation_disabled_reflected_in_prompt(
-        self, minimal_config_yaml_file
-    ):
-        config = Config.from_file(minimal_config_yaml_file)
-        prompt = build_system_prompt(config)
-        assert "disabled" in prompt.lower()
-
-    def test_never_kill_rule(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        prompt = build_system_prompt(config)
-        assert "never kill" in prompt.lower()
-
-
-class TestSystemPromptWatchedProcesses:
-    """Test watched processes appear in prompt."""
-
-    def test_includes_watched_processes(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        prompt = build_system_prompt(config)
+    def test_includes_watched_processes(self, config):
+        prompt = build_orchestrator_prompt(config)
         assert "my-api-server" in prompt
         assert "background-worker" in prompt
 
-    def test_no_watched_processes_section_when_empty(self, minimal_config_yaml_file):
-        config = Config.from_file(minimal_config_yaml_file)
-        prompt = build_system_prompt(config)
-        assert "Watched Processes" not in prompt
-
-
-class TestSystemPromptWatchedContainers:
-    """Test watched containers appear in prompt."""
-
-    def test_includes_watched_containers(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        prompt = build_system_prompt(config)
+    def test_includes_watched_containers_section(self, config):
+        prompt = build_orchestrator_prompt(config)
         assert "Watched Containers" in prompt
 
-    def test_no_watched_containers_section_when_empty(self, minimal_config_yaml_file):
+    def test_injects_last_cycle_summary(self, config):
+        prompt = build_orchestrator_prompt(
+            config,
+            last_cycle_summary="All systems healthy, no issues found.",
+        )
+        assert "Last Cycle Summary" in prompt
+        assert "All systems healthy" in prompt
+
+    def test_no_last_cycle_section_when_empty(self, config):
+        prompt = build_orchestrator_prompt(config, last_cycle_summary="")
+        assert "Last Cycle Summary" not in prompt
+
+    def test_injects_watched_context(self, config):
+        prompt = build_orchestrator_prompt(
+            config,
+            watched_context="[2026-03-01] nginx high CPU | Action: restarted",
+        )
+        assert "Recent Memory" in prompt
+        assert "nginx high CPU" in prompt
+
+    def test_no_memory_section_when_empty(self, config):
+        prompt = build_orchestrator_prompt(config, watched_context="")
+        assert "Recent Memory" not in prompt
+
+    def test_no_memory_section_when_no_observations(self, config):
+        prompt = build_orchestrator_prompt(
+            config, watched_context="No past observations in memory."
+        )
+        assert "Recent Memory" not in prompt
+
+    def test_remediation_disabled(self, minimal_config_yaml_file):
         config = Config.from_file(minimal_config_yaml_file)
-        prompt = build_system_prompt(config)
+        prompt = build_orchestrator_prompt(config)
+        assert "disabled" in prompt.lower()
+
+    def test_no_watched_processes_when_empty(self, minimal_config_yaml_file):
+        config = Config.from_file(minimal_config_yaml_file)
+        prompt = build_orchestrator_prompt(config)
+        assert "Watched Processes" not in prompt
+
+    def test_no_watched_containers_when_empty(self, minimal_config_yaml_file):
+        config = Config.from_file(minimal_config_yaml_file)
+        prompt = build_orchestrator_prompt(config)
         assert "Watched Containers" not in prompt
 
 
-class TestSystemPromptMemoryContext:
-    """Test that memory context is injected into the prompt."""
+class TestInvestigatorPrompt:
+    """Test the investigator system prompt."""
 
-    def test_includes_memory_context(self, config_yaml_file):
+    @pytest.fixture
+    def config(self, config_yaml_file):
+        return Config.from_file(config_yaml_file)
+
+    @pytest.fixture
+    def prompt(self, config):
+        return build_investigator_prompt(config, "nginx container is down")
+
+    def test_includes_investigator_identity(self, prompt):
+        assert "investigating" in prompt.lower()
+
+    def test_includes_issue_description(self, prompt):
+        assert "nginx container is down" in prompt
+
+    def test_includes_query_memory_instruction(self, prompt):
+        assert "query_memory" in prompt
+
+    def test_includes_remediation_policy(self, prompt):
+        assert "Remediation Policy" in prompt
+
+    def test_includes_secrets_warning(self, prompt):
+        assert "secret" in prompt.lower()
+
+    def test_includes_never_kill_rule(self, prompt):
+        assert "never kill" in prompt.lower()
+
+    def test_includes_report_instruction(self, prompt):
+        assert "report" in prompt.lower()
+
+    def test_includes_docker_logs_suggestion(self, prompt):
+        assert "docker logs" in prompt
+
+    def test_remediation_disabled(self, minimal_config_yaml_file):
+        config = Config.from_file(minimal_config_yaml_file)
+        prompt = build_investigator_prompt(config, "disk full")
+        assert "disabled" in prompt.lower()
+
+    def test_includes_allowed_services(self, config):
+        prompt = build_investigator_prompt(config, "service down")
+        assert "nginx" in prompt
+
+    def test_includes_allowed_containers(self, config):
+        prompt = build_investigator_prompt(config, "container issue")
+        assert "redis" in prompt
+        assert "postgres" in prompt
+
+
+class TestBuildSystemPromptBackwardsCompat:
+    """Test that build_system_prompt still works as a wrapper."""
+
+    def test_returns_string(self, config_yaml_file):
         config = Config.from_file(config_yaml_file)
-        memory_context = "[2026-03-01T12:00:00Z] High CPU on nginx | Action: Restarted | Outcome: Resolved"
-        prompt = build_system_prompt(config, memory_context=memory_context)
-        assert "Recent Memory" in prompt
-        assert "High CPU on nginx" in prompt
+        prompt = build_system_prompt(config)
+        assert isinstance(prompt, str)
+        assert "orchestrator" in prompt.lower()
 
-    def test_no_memory_section_when_empty(self, config_yaml_file):
-        config = Config.from_file(config_yaml_file)
-        prompt = build_system_prompt(config, memory_context="")
-        assert "Recent Memory" not in prompt
-
-    def test_no_memory_section_when_no_observations(self, config_yaml_file):
+    def test_passes_memory_context(self, config_yaml_file):
         config = Config.from_file(config_yaml_file)
         prompt = build_system_prompt(
-            config, memory_context="No past observations in memory."
+            config,
+            memory_context="[2026-03-01] High CPU on nginx",
         )
-        assert "Recent Memory" not in prompt
+        assert "High CPU on nginx" in prompt

@@ -56,9 +56,11 @@ def main(argv: list[str] | None = None) -> None:
     daemon = AgentDaemon(config)
 
     if args.once:
-        asyncio.run(daemon._run_check_cycle())
+        # H7: use run_once() which initializes properly
+        asyncio.run(daemon.run_once())
     elif args.interactive:
-        # Placeholder for interactive mode
-        pass
+        # M8: explicit error instead of silent no-op
+        print("Error: --interactive mode is not yet implemented", file=sys.stderr)
+        sys.exit(1)
     else:
         asyncio.run(daemon.run())

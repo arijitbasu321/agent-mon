@@ -23,7 +23,7 @@ class TestConfigLoading:
         config = Config.from_file(config_yaml_file)
         assert config.check_interval == 300
         assert config.model == "claude-sonnet-4-6"
-        assert config.max_turns == 25
+        assert config.max_turns == 100
 
     def test_load_minimal_config(self, minimal_config_yaml_file):
         config = Config.from_file(minimal_config_yaml_file)
@@ -145,7 +145,7 @@ class TestConfigBash:
     def test_bash_deny_list(self, config_yaml_file):
         config = Config.from_file(config_yaml_file)
         assert "rm -rf /" in config.bash.deny_list
-        assert "shutdown" in config.bash.deny_list
+        assert "shutdown -h" in config.bash.deny_list
         assert "reboot" in config.bash.deny_list
 
     def test_bash_deny_list_default_empty(self, minimal_config_yaml_file):

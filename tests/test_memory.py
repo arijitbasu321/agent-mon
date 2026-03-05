@@ -134,3 +134,65 @@ class TestMemoryStoreOperations:
         assert "high cpu" in doc
         assert "Action: restarted" in doc
         assert "Outcome: resolved" in doc
+
+    def test_store_with_entry_type(self, memory_store):
+        entry_id = memory_store.store(
+            "cycle complete", "monitored", "all clear",
+            entry_type="cycle_summary",
+        )
+        result = memory_store._collection.get(ids=[entry_id])
+        assert result["metadatas"][0]["entry_type"] == "cycle_summary"
+
+    def test_store_default_entry_type(self, memory_store):
+        entry_id = memory_store.store("obs", "act", "out")
+        result = memory_store._collection.get(ids=[entry_id])
+        assert result["metadatas"][0]["entry_type"] == "observation"
+
+
+class TestGetLastCycleSummary:
+    """Test get_last_cycle_summary() method."""
+
+    def test_returns_empty_when_no_summaries(self, memory_store):
+        result = memory_store.get_last_cycle_summary()
+        assert result == ""
+
+    def test_returns_empty_when_only_observations(self, memory_store):
+        memory_store.store("obs1", "act1", "out1")
+        result = memory_store.get_last_cycle_summary()
+        assert result == ""
+
+    def test_returns_most_recent_summary(self, memory_store):
+        memory_store.store(
+            "old summary", "monitored", "issues found",
+            entry_type="cycle_summary",
+        )
+        memory_store.store(
+            "recent summary", "monitored", "all clear",
+            entry_type="cycle_summary",
+        )
+        result = memory_store.get_last_cycle_summary()
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+
+class TestQueryByServices:
+    """Test query_by_services() method."""
+
+    def test_returns_empty_for_empty_list(self, memory_store):
+        result = memory_store.query_by_services([])
+        assert result == ""
+
+    def test_queries_with_service_names(self, memory_store):
+        memory_store.store(
+            "nginx high CPU", "restarted nginx", "CPU dropped",
+        )
+        memory_store.store(
+            "redis memory spike", "cleared cache", "memory normalized",
+        )
+        result = memory_store.query_by_services(["nginx", "redis"])
+        assert isinstance(result, str)
+        assert "|" in result  # contains formatted entries
+
+    def test_returns_no_observations_for_empty_store(self, memory_store):
+        result = memory_store.query_by_services(["nginx"])
+        assert "No past observations" in result

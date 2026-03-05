@@ -7,7 +7,7 @@
 # ---------------------------------------------------------------
 check_interval: 300                   # seconds between checks (min: 30)
 model: claude-sonnet-4-6              # claude-sonnet-4-6 | claude-opus-4-6
-max_turns: 25                         # max agent tool calls per cycle
+max_turns: 100                        # max agent tool calls per cycle
 
 # ---------------------------------------------------------------
 # Heartbeat
@@ -68,10 +68,14 @@ bash:
   deny_list:
     - "rm -rf /"
     - "rm -rf /*"
-    - "shutdown"
+    - "shutdown -h"
+    - "shutdown -r"
+    - "shutdown -P"
+    - "shutdown now"
     - "reboot"
     - "poweroff"
-    - "halt"
+    - "halt -p"
+    - "halt -f"
     - "init 0"
     - "init 6"
     - "mkfs"
@@ -85,7 +89,6 @@ bash:
     - "chown -R"
     - "userdel"
     - "groupdel"
-    - "passwd"
     - "iptables -F"
     - "iptables -X"
 

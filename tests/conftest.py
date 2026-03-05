@@ -16,7 +16,7 @@ import yaml
 SAMPLE_CONFIG_DICT = {
     "check_interval": 300,
     "model": "claude-sonnet-4-6",
-    "max_turns": 25,
+    "max_turns": 100,
     "heartbeat": {
         "enabled": True,
         "interval": 3600,
@@ -47,7 +47,10 @@ SAMPLE_CONFIG_DICT = {
     "bash": {
         "deny_list": [
             "rm -rf /",
-            "shutdown",
+            "shutdown -h",
+            "shutdown -r",
+            "shutdown -P",
+            "shutdown now",
             "reboot",
             "mkfs",
             "dd if=",
@@ -64,7 +67,7 @@ SAMPLE_CONFIG_DICT = {
 MINIMAL_CONFIG_DICT = {
     "check_interval": 300,
     "model": "claude-sonnet-4-6",
-    "max_turns": 25,
+    "max_turns": 100,
     "alerts": {
         "log_file": "/tmp/test-alerts.log",
     },
