@@ -555,12 +555,12 @@ class TestInvestigatorDispatch:
 
         assert captured["options"].max_turns <= 30
 
-    async def test_investigator_has_hooks(self, daemon):
+    async def test_investigator_has_can_use_tool(self, daemon):
         captured = {}
         with patch("claude_agent_sdk.query", _make_mock_query(captured)):
             await daemon._run_investigator("test issue")
 
-        assert "PreToolUse" in captured["options"].hooks
+        assert captured["options"].can_use_tool is not None
 
     async def test_investigator_error_returns_error_string(self, daemon):
         async def _raise(**kwargs):

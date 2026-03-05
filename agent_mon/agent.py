@@ -13,7 +13,9 @@ import time
 import aiohttp
 
 from agent_mon.config import Config
-from agent_mon.hooks import RateLimiter, build_sdk_hooks
+from agent_mon.hooks import (
+    RateLimiter, bash_denylist_guard, docker_remediation_guard,
+)
 from agent_mon.memory import MemoryStore
 from agent_mon.prompt import build_orchestrator_prompt, build_investigator_prompt
 from agent_mon.tools import create_orchestrator_tools, create_investigator_tools
@@ -294,9 +296,6 @@ class AgentDaemon:
                 investigate_fn=investigate_fn,
             )
 
-            # Build SDK hooks
-            hooks = build_sdk_hooks(self.config, self.rate_limiter)
-
             # Run orchestrator via Claude Agent SDK
             from claude_agent_sdk import query
             from claude_agent_sdk.types import ClaudeAgentOptions
@@ -306,7 +305,7 @@ class AgentDaemon:
                 max_turns=self.config.max_turns,
                 system_prompt=system_prompt,
                 mcp_servers={"agent-mon": tools},
-                hooks=hooks,
+                can_use_tool=self._build_can_use_tool(),
                 permission_mode="bypassPermissions",
             )
 
@@ -352,8 +351,6 @@ class AgentDaemon:
                 self.config, self.memory_store
             )
 
-            hooks = build_sdk_hooks(self.config, self.rate_limiter)
-
             max_turns = min(30, self.config.max_turns)
 
             options = ClaudeAgentOptions(
@@ -361,7 +358,7 @@ class AgentDaemon:
                 max_turns=max_turns,
                 system_prompt=system_prompt,
                 mcp_servers={"agent-mon-investigator": tools},
-                hooks=hooks,
+                can_use_tool=self._build_can_use_tool(),
                 permission_mode="bypassPermissions",
             )
 
@@ -389,6 +386,45 @@ class AgentDaemon:
         except Exception as exc:
             logger.error("Investigator failed: %s", exc)
             return f"Investigation failed: {exc}"
+
+    def _build_can_use_tool(self):
+        """Build a can_use_tool callback for the SDK.
+
+        Returns an async function that checks bash deny-list and docker
+        remediation guards before allowing tool execution.
+        """
+        config = self.config
+        rate_limiter = self.rate_limiter
+
+        async def _can_use_tool(tool_name, tool_input, context):
+            # Check bash deny-list
+            if tool_name == "Bash":
+                result = bash_denylist_guard(
+                    tool_name, tool_input, config=config,
+                )
+                if result.decision == "deny":
+                    return {
+                        "behavior": "deny",
+                        "message": result.reason,
+                        "interrupt": False,
+                    }
+
+            # Check docker remediation guard
+            if "docker" in tool_name.lower():
+                result = docker_remediation_guard(
+                    tool_name, tool_input, config=config,
+                    rate_limiter=rate_limiter,
+                )
+                if result.decision == "deny":
+                    return {
+                        "behavior": "deny",
+                        "message": result.reason,
+                        "interrupt": False,
+                    }
+
+            return {"behavior": "allow", "updated_input": None, "updated_permissions": None}
+
+        return _can_use_tool
 
     # C3: non-blocking subprocess + H5: check resend key
     async def _send_heartbeat(self):
