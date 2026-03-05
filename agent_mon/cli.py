@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 
 from agent_mon.agent import AgentDaemon
@@ -40,6 +41,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv or sys.argv[1:])
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
 
     try:
         config = Config.from_file(args.config)
