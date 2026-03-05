@@ -496,12 +496,12 @@ class TestOrchestratorFlow:
         daemon.http_session = AsyncMock()
         return daemon
 
-    async def test_cycle_creates_client_with_monitoring_prompt(self, daemon):
+    async def test_cycle_creates_client_with_orchestrator_prompt(self, daemon):
         captured = {}
         with patch("claude_agent_sdk.query", _make_mock_query(captured)):
             await daemon._run_check_cycle()
 
-        assert "monitoring" in captured["options"].system_prompt.lower()
+        assert "orchestrator" in captured["options"].system_prompt.lower()
 
     async def test_cycle_passes_mcp_server(self, daemon):
         captured = {}
@@ -530,6 +530,171 @@ class TestOrchestratorFlow:
             await daemon._run_check_cycle()
 
         assert captured["options"].can_use_tool is not None
+
+
+# ===========================================================================
+# Investigator dispatch tests
+# ===========================================================================
+
+
+class TestInvestigatorDispatch:
+    """Test _run_investigator creates sub-agent with correct setup."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        return daemon
+
+    async def test_investigator_creates_sub_agent(self, daemon):
+        captured = {}
+        with patch("claude_agent_sdk.query", _make_mock_query(captured)):
+            result = await daemon._run_investigator("nginx is down")
+
+        assert captured["options"] is not None
+        # Should return non-error string
+        assert "failed" not in result.lower()
+
+    async def test_investigator_includes_issue_in_prompt(self, daemon):
+        captured = {}
+        with patch("claude_agent_sdk.query", _make_mock_query(captured)):
+            await daemon._run_investigator("redis memory spike")
+
+        assert "redis memory spike" in captured["options"].system_prompt
+
+    async def test_investigator_max_turns_capped_at_30(self, daemon):
+        captured = {}
+        with patch("claude_agent_sdk.query", _make_mock_query(captured)):
+            await daemon._run_investigator("test issue")
+
+        assert captured["options"].max_turns <= 30
+
+    async def test_investigator_has_can_use_tool(self, daemon):
+        captured = {}
+        with patch("claude_agent_sdk.query", _make_mock_query(captured)):
+            await daemon._run_investigator("test issue")
+
+        assert captured["options"].can_use_tool is not None
+
+    async def test_investigator_error_returns_error_string(self, daemon):
+        async def _raise(**kwargs):
+            raise RuntimeError("API down")
+            yield
+
+        with patch("claude_agent_sdk.query", side_effect=_raise):
+            result = await daemon._run_investigator("test issue")
+
+        assert "failed" in result.lower()
+
+    async def test_investigator_timeout_returns_timeout_string(self, daemon):
+        """M4: test wall-clock timeout on investigator."""
+        async def _slow(**kwargs):
+            await asyncio.sleep(999)
+            yield
+
+        with patch("claude_agent_sdk.query", _slow):
+            with patch("agent_mon.agent._INVESTIGATOR_TIMEOUT", 0.01):
+                result = await daemon._run_investigator("test issue")
+
+        assert "timed out" in result.lower()
+
+    async def test_investigator_serialized_by_semaphore(self, daemon):
+        """Verify that concurrent investigate calls are serialized."""
+        call_count = 0
+        max_concurrent = 0
+        current_concurrent = 0
+
+        async def _tracking_query(*, prompt, options=None, **kwargs):
+            nonlocal call_count, max_concurrent, current_concurrent
+            if hasattr(prompt, "__aiter__"):
+                async for _ in prompt:
+                    pass
+            call_count += 1
+            current_concurrent += 1
+            if current_concurrent > max_concurrent:
+                max_concurrent = current_concurrent
+            await asyncio.sleep(0.05)
+            current_concurrent -= 1
+            return
+            yield
+
+        with patch("claude_agent_sdk.query", _tracking_query):
+            # Launch two investigations concurrently
+            await asyncio.gather(
+                daemon._run_investigator("issue-A"),
+                daemon._run_investigator("issue-B"),
+            )
+
+        # Both should have run
+        assert call_count == 2
+        # But never concurrently (semaphore ensures serialization)
+        assert max_concurrent == 1
+
+    async def test_investigator_disabled_after_threshold_failures(self, daemon):
+        """After 5 consecutive failures, investigator is skipped."""
+        daemon._investigator_consecutive_failures = 5
+
+        # Should not even call query -- returns immediately
+        result = await daemon._run_investigator("test issue")
+
+        assert "INVESTIGATOR_DISABLED" in result
+        assert "send_alert" in result.lower()
+
+    async def test_investigator_failure_counter_increments(self, daemon):
+        """Each failure increments the counter."""
+        async def _raise(**kwargs):
+            raise RuntimeError("API down")
+            yield
+
+        with patch("claude_agent_sdk.query", side_effect=_raise):
+            await daemon._run_investigator("issue 1")
+            await daemon._run_investigator("issue 2")
+
+        assert daemon._investigator_consecutive_failures == 2
+
+    async def test_investigator_success_resets_failure_counter(self, daemon):
+        """A successful investigation resets the counter."""
+        daemon._investigator_consecutive_failures = 3
+
+        with patch("claude_agent_sdk.query", _make_mock_query()):
+            await daemon._run_investigator("test issue")
+
+        assert daemon._investigator_consecutive_failures == 0
+
+    async def test_investigator_timeout_increments_failure_counter(self, daemon):
+        """Timeout counts as a failure."""
+        async def _slow(**kwargs):
+            await asyncio.sleep(999)
+            yield
+
+        with patch("claude_agent_sdk.query", _slow):
+            with patch("agent_mon.agent._INVESTIGATOR_TIMEOUT", 0.01):
+                await daemon._run_investigator("test issue")
+
+        assert daemon._investigator_consecutive_failures == 1
+
+
+class TestInvestigatorFailureCounterReset:
+    """Test that investigator failure counter resets each check cycle."""
+
+    @pytest.fixture
+    def daemon(self, config_yaml_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        daemon = AgentDaemon(config)
+        daemon.http_session = AsyncMock()
+        return daemon
+
+    async def test_counter_resets_at_cycle_start(self, daemon):
+        daemon._investigator_consecutive_failures = 4
+
+        with patch("claude_agent_sdk.query", _make_mock_query()):
+            await daemon._run_check_cycle()
+
+        assert daemon._investigator_consecutive_failures == 0
 
 
 class TestPreCycleMemory:

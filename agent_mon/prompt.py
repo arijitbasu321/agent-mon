@@ -13,16 +13,18 @@ def build_orchestrator_prompt(
 ) -> str:
     """Build the system prompt for the monitoring orchestrator agent."""
     sections = [
-        "You are a system monitoring agent. Your job is to keep this",
-        "system healthy by scanning, investigating, and reporting issues.",
+        "You are a system monitoring orchestrator. Your job is to keep this",
+        "system healthy by scanning broadly, identifying issues, and dispatching",
+        "deep investigations for each one.",
         "",
         "## Goal",
         "",
         "1. Use bash to scan system health: processes, memory, disk, load,",
         "   failed services, journal errors, container status, network.",
-        "2. For each issue found, investigate it directly using bash.",
-        "   Check logs, correlate metrics, diagnose root causes.",
-        "3. After investigating all issues, send ONE consolidated `send_alert`",
+        "2. For each issue found, call `investigate_issue` with a description.",
+        "   Dispatch investigations sequentially -- after each returns, re-verify",
+        "   whether the next issue is still active before investigating it.",
+        "3. After all investigations complete, send ONE consolidated `send_alert`",
         "   covering everything found and done this cycle.",
         "4. Store a cycle summary via `store_memory` so the next cycle has context.",
         "",

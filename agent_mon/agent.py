@@ -17,11 +17,14 @@ from agent_mon.hooks import (
     RateLimiter, bash_denylist_guard, docker_remediation_guard,
 )
 from agent_mon.memory import MemoryStore
-from agent_mon.prompt import build_orchestrator_prompt
-from agent_mon.tools import create_orchestrator_tools
+from agent_mon.prompt import build_orchestrator_prompt, build_investigator_prompt
+from agent_mon.tools import create_orchestrator_tools, create_investigator_tools
 from agent_mon.tools.alerts import AlertManager
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock timeout for investigator sub-agents (M4)
+_INVESTIGATOR_TIMEOUT = 300  # 5 minutes
 
 
 async def _streaming_prompt(text: str):
@@ -213,6 +216,12 @@ class AgentDaemon:
         self.alert_manager = AlertManager(config)
         self.memory_store: MemoryStore | None = None
         self.rate_limiter = RateLimiter()  # H2: instance-owned rate limiter
+        # Serialize investigator dispatch -- only one at a time
+        self._investigation_semaphore = asyncio.Semaphore(1)
+        # Track consecutive investigator failures; after threshold, skip
+        # investigations and let the orchestrator send alerts directly.
+        self._investigator_consecutive_failures = 0
+        self._investigator_failure_threshold = 5
 
         if config.memory.enabled:
             self.memory_store = MemoryStore(config.memory)
@@ -287,6 +296,9 @@ class AgentDaemon:
                 await self.alert_manager.send_alert(severity, message, message)
             return
 
+        # Reset investigator failure counter each cycle
+        self._investigator_consecutive_failures = 0
+
         try:
             # Pre-cycle memory queries
             last_cycle_summary = ""
@@ -315,16 +327,27 @@ class AgentDaemon:
                 watched_context=watched_context,
             )
 
+            # C1: async investigate_fn closure
+            async def investigate_fn(description: str) -> str:
+                return await self._run_investigator(description)
+
             # Create orchestrator tools
             tools = create_orchestrator_tools(
                 self.config,
                 self.alert_manager,
                 self.memory_store,
+                investigate_fn=investigate_fn,
             )
 
             # Run orchestrator via Claude Agent SDK
             from claude_agent_sdk import query
             from claude_agent_sdk.types import ClaudeAgentOptions
+
+            # Prevent SDK from closing stdin before the cycle completes.
+            # Default is 60s which is too short for cycles with investigations.
+            os.environ["CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"] = str(
+                max(300_000, self.config.max_turns * 30_000)
+            )
 
             options = ClaudeAgentOptions(
                 model=self.config.model,
@@ -358,6 +381,115 @@ class AgentDaemon:
                     await self.alert_manager.send_alert(
                         severity, message, message
                     )
+
+    # C1: async investigator + M4: wall-clock timeout
+    # Semaphore ensures only one investigator runs at a time
+    async def _run_investigator(self, issue_description: str) -> str:
+        """Run an investigator sub-agent for a specific issue.
+
+        Uses a semaphore to ensure only one investigator runs at a time,
+        preventing concurrent subprocess spawning and resource exhaustion.
+
+        After 5 consecutive failures, skips investigation and returns a
+        failure message so the orchestrator can send a direct alert instead.
+
+        Returns the investigation result text.
+        """
+        # Guard: if investigator has failed too many times, skip and let
+        # the orchestrator handle it directly via send_alert.
+        if (
+            self._investigator_consecutive_failures
+            >= self._investigator_failure_threshold
+        ):
+            logger.warning(
+                "Investigator disabled after %d consecutive failures. "
+                "Skipping investigation for: %s",
+                self._investigator_consecutive_failures,
+                issue_description[:100],
+            )
+            return (
+                f"INVESTIGATOR_DISABLED: Investigator has failed "
+                f"{self._investigator_consecutive_failures} consecutive times. "
+                f"Send an alert for this issue directly via send_alert."
+            )
+
+        async with self._investigation_semaphore:
+            try:
+                from claude_agent_sdk import query
+                from claude_agent_sdk.types import ClaudeAgentOptions
+
+                logger.info(
+                    "Dispatching investigator for: %s",
+                    issue_description[:100],
+                )
+
+                system_prompt = build_investigator_prompt(
+                    self.config, issue_description
+                )
+
+                tools = create_investigator_tools(
+                    self.config, self.memory_store
+                )
+
+                max_turns = min(30, self.config.max_turns)
+
+                options = ClaudeAgentOptions(
+                    model=self.config.model,
+                    max_turns=max_turns,
+                    system_prompt=system_prompt,
+                    mcp_servers={"agent-mon-investigator": tools},
+                    can_use_tool=self._build_can_use_tool(),
+                    permission_mode="bypassPermissions",
+                )
+
+                async def _run():
+                    last_text = ""
+                    async for msg in query(
+                        prompt=_streaming_prompt(
+                            f"Investigate this issue: {issue_description}",
+                        ),
+                        options=options,
+                    ):
+                        _log_sdk_message(msg, prefix="investigator")
+                        if hasattr(msg, "result") and msg.result:
+                            last_text = msg.result
+                    return last_text
+
+                result = await asyncio.wait_for(
+                    _run(),
+                    timeout=_INVESTIGATOR_TIMEOUT,
+                )
+
+                logger.info(
+                    "Investigator completed for: %s",
+                    issue_description[:100],
+                )
+
+                # Success -- reset failure counter
+                self._investigator_consecutive_failures = 0
+
+                return result or "Investigation complete (no output)."
+
+            except asyncio.TimeoutError:
+                self._investigator_consecutive_failures += 1
+                logger.error(
+                    "Investigator timed out for: %s (failure %d/%d)",
+                    issue_description,
+                    self._investigator_consecutive_failures,
+                    self._investigator_failure_threshold,
+                )
+                return (
+                    f"Investigation timed out after {_INVESTIGATOR_TIMEOUT}s."
+                )
+            except Exception as exc:
+                self._investigator_consecutive_failures += 1
+                logger.error(
+                    "Investigator failed: %s (failure %d/%d)",
+                    exc,
+                    self._investigator_consecutive_failures,
+                    self._investigator_failure_threshold,
+                )
+                return f"Investigation failed: {exc}"
 
     def _build_can_use_tool(self):
         """Build a can_use_tool callback for the SDK.

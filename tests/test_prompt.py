@@ -30,11 +30,11 @@ class TestOrchestratorPrompt:
     def prompt(self, config):
         return build_orchestrator_prompt(config)
 
-    def test_includes_monitoring_identity(self, prompt):
-        assert "monitoring" in prompt.lower()
+    def test_includes_orchestrator_identity(self, prompt):
+        assert "orchestrator" in prompt.lower()
 
-    def test_includes_investigate_instruction(self, prompt):
-        assert "investigate" in prompt.lower()
+    def test_includes_investigate_issue_reference(self, prompt):
+        assert "investigate_issue" in prompt
 
     def test_includes_consolidated_alert_instruction(self, prompt):
         assert "send_alert" in prompt
@@ -176,7 +176,7 @@ class TestBuildSystemPromptBackwardsCompat:
         config = Config.from_file(config_yaml_file)
         prompt = build_system_prompt(config)
         assert isinstance(prompt, str)
-        assert "monitoring" in prompt.lower()
+        assert "orchestrator" in prompt.lower()
 
     def test_passes_memory_context(self, config_yaml_file):
         config = Config.from_file(config_yaml_file)
