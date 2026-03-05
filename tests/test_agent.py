@@ -480,7 +480,7 @@ def _make_mock_query(captured: dict | None = None):
 
 
 # ===========================================================================
-# Orchestrator / Investigator architecture tests
+# Orchestrator architecture tests
 # ===========================================================================
 
 
@@ -496,12 +496,12 @@ class TestOrchestratorFlow:
         daemon.http_session = AsyncMock()
         return daemon
 
-    async def test_cycle_creates_client_with_orchestrator_prompt(self, daemon):
+    async def test_cycle_creates_client_with_monitoring_prompt(self, daemon):
         captured = {}
         with patch("claude_agent_sdk.query", _make_mock_query(captured)):
             await daemon._run_check_cycle()
 
-        assert "orchestrator" in captured["options"].system_prompt.lower()
+        assert "monitoring" in captured["options"].system_prompt.lower()
 
     async def test_cycle_passes_mcp_server(self, daemon):
         captured = {}
@@ -524,69 +524,12 @@ class TestOrchestratorFlow:
 
         assert captured["options"].model == daemon.config.model
 
-
-class TestInvestigatorDispatch:
-    """Test _run_investigator creates sub-agent with correct setup."""
-
-    @pytest.fixture
-    def daemon(self, config_yaml_file):
-        from agent_mon.config import Config
-
-        config = Config.from_file(config_yaml_file)
-        daemon = AgentDaemon(config)
-        return daemon
-
-    async def test_investigator_creates_sub_agent(self, daemon):
+    async def test_cycle_has_can_use_tool(self, daemon):
         captured = {}
         with patch("claude_agent_sdk.query", _make_mock_query(captured)):
-            result = await daemon._run_investigator("nginx is down")
-
-        assert captured["options"] is not None
-        # Should return non-error string
-        assert "failed" not in result.lower()
-
-    async def test_investigator_includes_issue_in_prompt(self, daemon):
-        captured = {}
-        with patch("claude_agent_sdk.query", _make_mock_query(captured)):
-            await daemon._run_investigator("redis memory spike")
-
-        assert "redis memory spike" in captured["options"].system_prompt
-
-    async def test_investigator_max_turns_capped_at_30(self, daemon):
-        captured = {}
-        with patch("claude_agent_sdk.query", _make_mock_query(captured)):
-            await daemon._run_investigator("test issue")
-
-        assert captured["options"].max_turns <= 30
-
-    async def test_investigator_has_can_use_tool(self, daemon):
-        captured = {}
-        with patch("claude_agent_sdk.query", _make_mock_query(captured)):
-            await daemon._run_investigator("test issue")
+            await daemon._run_check_cycle()
 
         assert captured["options"].can_use_tool is not None
-
-    async def test_investigator_error_returns_error_string(self, daemon):
-        async def _raise(**kwargs):
-            raise RuntimeError("API down")
-            yield
-
-        with patch("claude_agent_sdk.query", side_effect=_raise):
-            result = await daemon._run_investigator("test issue")
-
-        assert "failed" in result.lower()
-
-    async def test_investigator_timeout_returns_timeout_string(self, daemon):
-        """M4: test wall-clock timeout on investigator."""
-        async def _slow(**kwargs):
-            await asyncio.sleep(999)
-            yield
-
-        with patch("claude_agent_sdk.query", _slow):
-            with patch("agent_mon.agent._INVESTIGATOR_TIMEOUT", 0.01):
-                result = await daemon._run_investigator("test issue")
-
-        assert "timed out" in result.lower()
 
 
 class TestPreCycleMemory:

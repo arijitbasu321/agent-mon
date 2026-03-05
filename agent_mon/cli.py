@@ -42,9 +42,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv or sys.argv[1:])
 
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=log_format,
         stream=sys.stderr,
     )
 
@@ -59,6 +60,18 @@ def main(argv: list[str] | None = None) -> None:
     except ConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # Add file handler for real-time activity logging
+    try:
+        from pathlib import Path
+        log_path = Path(config.alerts.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(config.alerts.log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(log_format))
+        logging.getLogger().addHandler(file_handler)
+    except OSError as exc:
+        print(f"Warning: could not open log file: {exc}", file=sys.stderr)
 
     daemon = AgentDaemon(config)
 

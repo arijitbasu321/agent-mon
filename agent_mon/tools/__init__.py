@@ -6,8 +6,6 @@ using the Claude Agent SDK's @tool decorator and create_sdk_mcp_server().
 
 from __future__ import annotations
 
-from typing import Awaitable, Callable
-
 from claude_agent_sdk import tool, create_sdk_mcp_server
 from claude_agent_sdk.types import McpSdkServerConfig
 
@@ -25,12 +23,10 @@ def create_orchestrator_tools(
     config: Config,
     alert_manager: AlertManager,
     memory_store: MemoryStore | None = None,
-    investigate_fn: Callable[[str], Awaitable[str]] | None = None,
 ) -> McpSdkServerConfig:
-    """Create the MCP server for the orchestrator agent.
+    """Create the MCP server for the monitoring agent.
 
-    Orchestrator gets: send_alert, get_alert_history, store_memory, investigate_issue.
-    It does NOT get query_memory (that's for investigators).
+    Tools: send_alert, get_alert_history, store_memory, query_memory.
     """
     sdk_tools = []
 
@@ -75,35 +71,7 @@ def create_orchestrator_tools(
 
         sdk_tools.append(store_memory)
 
-    # --- Investigate tool (C1: now async) ---
-    if investigate_fn is not None:
-        @tool(
-            "investigate_issue",
-            "Dispatch a sub-agent to deeply investigate a specific issue.",
-            {"description": str},
-        )
-        async def investigate_issue(args):
-            result = await investigate_fn(args["description"])
-            return _text_result(result)
-
-        sdk_tools.append(investigate_issue)
-
-    return create_sdk_mcp_server(
-        name="agent-mon-orchestrator", tools=sdk_tools,
-    )
-
-
-def create_investigator_tools(
-    config: Config,
-    memory_store: MemoryStore | None = None,
-) -> McpSdkServerConfig:
-    """Create the MCP server for an investigator sub-agent.
-
-    Investigator gets: query_memory.
-    It does NOT get send_alert or store_memory (orchestrator handles those).
-    """
-    sdk_tools = []
-
+    # --- Query memory tool ---
     if memory_store is not None and config.memory.enabled:
         @tool(
             "query_memory",
@@ -119,7 +87,7 @@ def create_investigator_tools(
         sdk_tools.append(query_memory)
 
     return create_sdk_mcp_server(
-        name="agent-mon-investigator", tools=sdk_tools,
+        name="agent-mon", tools=sdk_tools,
     )
 
 
@@ -133,5 +101,5 @@ def create_monitoring_tools(
     Returns the full orchestrator tool set (without investigate_issue).
     """
     return create_orchestrator_tools(
-        config, alert_manager, memory_store, investigate_fn=None,
+        config, alert_manager, memory_store,
     )
