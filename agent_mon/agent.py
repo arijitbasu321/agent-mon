@@ -27,6 +27,16 @@ logger = logging.getLogger(__name__)
 _INVESTIGATOR_TIMEOUT = 300  # 5 minutes
 
 
+async def _streaming_prompt(text: str):
+    """Wrap a prompt string as an AsyncIterable for SDK streaming mode."""
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": text},
+        "parent_tool_use_id": None,
+        "session_id": "default",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Non-blocking subprocess helper (C2/C3)
 # ---------------------------------------------------------------------------
@@ -310,7 +320,7 @@ class AgentDaemon:
             )
 
             async for _msg in query(
-                prompt="Run a full system health check.",
+                prompt=_streaming_prompt("Run a full system health check."),
                 options=options,
             ):
                 pass  # consume the async iterator
@@ -365,7 +375,9 @@ class AgentDaemon:
             async def _run():
                 last_text = ""
                 async for msg in query(
-                    prompt=f"Investigate this issue: {issue_description}",
+                    prompt=_streaming_prompt(
+                        f"Investigate this issue: {issue_description}",
+                    ),
                     options=options,
                 ):
                     # Capture the last result message text

@@ -470,6 +470,10 @@ def _make_mock_query(captured: dict | None = None):
         if captured is not None:
             captured["options"] = options
             captured["prompt"] = prompt
+        # Drain the prompt if it's an async iterable
+        if hasattr(prompt, "__aiter__"):
+            async for _ in prompt:
+                pass
         return
         yield  # make it an async generator
     return _mock_query
