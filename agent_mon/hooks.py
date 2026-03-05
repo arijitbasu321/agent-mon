@@ -1,4 +1,8 @@
-"""PreToolUse hooks: bash deny-list guard and Docker remediation guard."""
+"""PreToolUse hooks: bash deny-list guard and Docker remediation guard.
+
+Hooks are implemented both as plain functions (for unit testing) and as
+SDK-compatible async hook callbacks via build_sdk_hooks().
+"""
 
 from __future__ import annotations
 
@@ -123,3 +127,42 @@ def docker_remediation_guard(
         return HookResult(decision="deny", reason=reason)
 
     return HookResult(decision="allow")
+
+
+# ---------------------------------------------------------------------------
+# SDK hook builder
+# ---------------------------------------------------------------------------
+
+def build_sdk_hooks(config: Config, rate_limiter: RateLimiter | None = None):
+    """Build SDK-compatible PreToolUse hooks dict.
+
+    Returns a dict suitable for ClaudeAgentOptions.hooks:
+        {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[...])]}
+    """
+    from claude_agent_sdk.types import HookMatcher
+
+    limiter = rate_limiter or _default_rate_limiter
+
+    async def _bash_hook(hook_input, session_id, context):
+        tool_input = hook_input.get("tool_input", {})
+        result = bash_denylist_guard("Bash", tool_input, config=config)
+        if result.decision == "deny":
+            return {"decision": "block", "reason": result.reason}
+        return {}
+
+    async def _docker_hook(hook_input, session_id, context):
+        tool_input = hook_input.get("tool_input", {})
+        tool_name = hook_input.get("tool_name", "")
+        result = docker_remediation_guard(
+            tool_name, tool_input, config=config, rate_limiter=limiter,
+        )
+        if result.decision == "deny":
+            return {"decision": "block", "reason": result.reason}
+        return {}
+
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="Bash", hooks=[_bash_hook]),
+            HookMatcher(matcher="docker", hooks=[_docker_hook]),
+        ],
+    }

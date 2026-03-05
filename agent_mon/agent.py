@@ -13,7 +13,7 @@ import time
 import aiohttp
 
 from agent_mon.config import Config
-from agent_mon.hooks import bash_denylist_guard, docker_remediation_guard, RateLimiter
+from agent_mon.hooks import RateLimiter, build_sdk_hooks
 from agent_mon.memory import MemoryStore
 from agent_mon.prompt import build_orchestrator_prompt, build_investigator_prompt
 from agent_mon.tools import create_orchestrator_tools, create_investigator_tools
@@ -295,20 +295,26 @@ class AgentDaemon:
             )
 
             # Build SDK hooks
-            hooks = self._build_sdk_hooks()
+            hooks = build_sdk_hooks(self.config, self.rate_limiter)
 
             # Run orchestrator via Claude Agent SDK
-            from claude_agent_sdk import ClaudeSDKClient
+            from claude_agent_sdk import query
+            from claude_agent_sdk.types import ClaudeAgentOptions
 
-            client = ClaudeSDKClient(
+            options = ClaudeAgentOptions(
                 model=self.config.model,
                 max_turns=self.config.max_turns,
                 system_prompt=system_prompt,
-                tools=tools,
+                mcp_servers={"agent-mon": tools},
                 hooks=hooks,
+                permission_mode="bypassPermissions",
             )
 
-            await client.run("Run a full system health check.")
+            async for _msg in query(
+                prompt="Run a full system health check.",
+                options=options,
+            ):
+                pass  # consume the async iterator
 
             self.circuit_breaker.record_success()
 
@@ -335,7 +341,8 @@ class AgentDaemon:
         Returns the investigation result text.
         """
         try:
-            from claude_agent_sdk import ClaudeSDKClient
+            from claude_agent_sdk import query
+            from claude_agent_sdk.types import ClaudeAgentOptions
 
             system_prompt = build_investigator_prompt(
                 self.config, issue_description
@@ -345,20 +352,32 @@ class AgentDaemon:
                 self.config, self.memory_store
             )
 
-            hooks = self._build_sdk_hooks()
+            hooks = build_sdk_hooks(self.config, self.rate_limiter)
 
             max_turns = min(30, self.config.max_turns)
 
-            client = ClaudeSDKClient(
+            options = ClaudeAgentOptions(
                 model=self.config.model,
                 max_turns=max_turns,
                 system_prompt=system_prompt,
-                tools=tools,
+                mcp_servers={"agent-mon-investigator": tools},
                 hooks=hooks,
+                permission_mode="bypassPermissions",
             )
 
+            async def _run():
+                last_text = ""
+                async for msg in query(
+                    prompt=f"Investigate this issue: {issue_description}",
+                    options=options,
+                ):
+                    # Capture the last result message text
+                    if hasattr(msg, "type") and msg.get("type") == "result":
+                        last_text = str(msg)
+                return last_text
+
             result = await asyncio.wait_for(
-                client.run(f"Investigate this issue: {issue_description}"),
+                _run(),
                 timeout=_INVESTIGATOR_TIMEOUT,
             )
 
@@ -370,25 +389,6 @@ class AgentDaemon:
         except Exception as exc:
             logger.error("Investigator failed: %s", exc)
             return f"Investigation failed: {exc}"
-
-    def _build_sdk_hooks(self) -> dict:
-        """Build the PreToolUse hooks dict for the SDK."""
-        config = self.config
-        rate_limiter = self.rate_limiter  # H2: use instance-owned limiter
-
-        def bash_hook(tool_name: str, tool_input: dict):
-            return bash_denylist_guard(tool_name, tool_input, config=config)
-
-        def docker_hook(tool_name: str, tool_input: dict):
-            return docker_remediation_guard(
-                tool_name, tool_input, config=config,
-                rate_limiter=rate_limiter,
-            )
-
-        return {
-            "bash": bash_hook,
-            "docker": docker_hook,
-        }
 
     # C3: non-blocking subprocess + H5: check resend key
     async def _send_heartbeat(self):
