@@ -37,6 +37,30 @@ async def _streaming_prompt(text: str):
     }
 
 
+def _log_sdk_message(msg, *, prefix: str = "agent"):
+    """Log SDK streaming messages for real-time visibility."""
+    msg_type = type(msg).__name__
+
+    if msg_type == "AssistantMessage":
+        for block in getattr(msg, "content", []):
+            if hasattr(block, "text"):
+                # Truncate long text output
+                text = block.text[:200]
+                logger.info("[%s] %s", prefix, text)
+            elif hasattr(block, "name"):
+                logger.info("[%s] tool_use: %s", prefix, block.name)
+    elif msg_type == "ResultMessage":
+        cost = getattr(msg, "total_cost_usd", None)
+        turns = getattr(msg, "num_turns", None)
+        duration = getattr(msg, "duration_ms", None)
+        logger.info(
+            "[%s] done: turns=%s cost=$%s duration=%ss",
+            prefix, turns,
+            f"{cost:.4f}" if cost else "?",
+            f"{duration / 1000:.1f}" if duration else "?",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Non-blocking subprocess helper (C2/C3)
 # ---------------------------------------------------------------------------
@@ -319,11 +343,11 @@ class AgentDaemon:
                 permission_mode="bypassPermissions",
             )
 
-            async for _msg in query(
+            async for msg in query(
                 prompt=_streaming_prompt("Run a full system health check."),
                 options=options,
             ):
-                pass  # consume the async iterator
+                _log_sdk_message(msg, prefix="orchestrator")
 
             self.circuit_breaker.record_success()
 
@@ -380,9 +404,9 @@ class AgentDaemon:
                     ),
                     options=options,
                 ):
-                    # Capture the last result message text
-                    if hasattr(msg, "type") and msg.get("type") == "result":
-                        last_text = str(msg)
+                    _log_sdk_message(msg, prefix="investigator")
+                    if hasattr(msg, "result") and msg.result:
+                        last_text = msg.result
                 return last_text
 
             result = await asyncio.wait_for(
