@@ -83,6 +83,41 @@ class TestConfigAlerts:
         assert config.alerts.log_file == "/var/log/agent-mon.log"
 
 
+class TestConfigSlack:
+    """Test Slack alert configuration."""
+
+    def test_slack_config_parsed(self, config_yaml_file):
+        config = Config.from_file(config_yaml_file)
+        assert config.alerts.slack.enabled is True
+        assert config.alerts.slack.min_severity == "warning"
+        assert config.alerts.slack.dedup_window_minutes == 15
+
+    def test_slack_disabled_by_default(self, minimal_config_yaml_file):
+        config = Config.from_file(minimal_config_yaml_file)
+        assert config.alerts.slack.enabled is False
+
+    def test_slack_invalid_min_severity(self, sample_config_dict, tmp_path):
+        sample_config_dict["alerts"]["slack"]["min_severity"] = "panic"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(sample_config_dict))
+        with pytest.raises(ConfigError, match="severity"):
+            Config.from_file(config_path)
+
+    def test_slack_env_required_when_enabled(self, config_yaml_file, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.setenv("RESEND_API_KEY", "re_test_key")
+        monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+        config = Config.from_file(config_yaml_file)
+        with pytest.raises(ConfigError, match="SLACK_WEBHOOK_URL"):
+            config.validate_env()
+
+    def test_slack_env_not_required_when_disabled(self, minimal_config_yaml_file, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+        config = Config.from_file(minimal_config_yaml_file)
+        config.validate_env()
+
+
 class TestConfigRemediation:
     """Test remediation policy configuration."""
 

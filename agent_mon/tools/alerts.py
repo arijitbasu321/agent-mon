@@ -61,7 +61,7 @@ def sanitize_secrets(text: str) -> str:
 
 
 class AlertManager:
-    """Manages alert dispatch: plain text log file + email via Resend."""
+    """Manages alert dispatch: plain text log file + email via Resend + Slack."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -70,6 +70,8 @@ class AlertManager:
 
         # Email dedup tracking: title -> last_sent_timestamp
         self._email_dedup: dict[str, float] = {}
+        # Slack dedup tracking: title -> last_sent_timestamp
+        self._slack_dedup: dict[str, float] = {}
 
         # Ensure log directory exists
         log_path = Path(config.alerts.log_file)
@@ -146,6 +148,42 @@ class AlertManager:
             else:
                 results.append("email: deduplicated")
 
+        # 3. Slack webhook
+        slack_config = self.config.alerts.slack
+        if (
+            slack_config.enabled
+            and self.http_session is not None
+            and SEVERITY_RANK.get(severity, 0)
+            >= SEVERITY_RANK.get(slack_config.min_severity, 1)
+        ):
+            if self._should_send_slack(original_title):
+                try:
+                    resp = await self.http_session.post(
+                        self._get_slack_webhook_url(),
+                        json={
+                            "text": (
+                                f"*[{severity.upper()}]* "
+                                f"`agent-mon@{self.hostname}`: {title}\n"
+                                f"{message}"
+                            ),
+                        },
+                    )
+                    if resp.status < 300:
+                        results.append("slack: sent")
+                    else:
+                        try:
+                            error_body = await resp.text()
+                        except Exception:
+                            error_body = ""
+                        results.append(
+                            f"slack: failed (HTTP {resp.status}: {error_body})"
+                        )
+                except (aiohttp.ClientError, Exception) as exc:
+                    logger.warning("Slack send failed: %s", exc)
+                    results.append(f"slack: failed ({exc})")
+            else:
+                results.append("slack: deduplicated")
+
         return "; ".join(results)
 
     def _should_send_email(self, title: str) -> bool:
@@ -165,9 +203,29 @@ class AlertManager:
         self._email_dedup[title] = now
         return True
 
+    def _should_send_slack(self, title: str) -> bool:
+        """Check dedup window for this Slack alert title."""
+        now = time.time()
+        window = self.config.alerts.slack.dedup_window_minutes * 60
+
+        self._slack_dedup = {
+            t: ts for t, ts in self._slack_dedup.items()
+            if now - ts < window
+        }
+
+        last_sent = self._slack_dedup.get(title, 0)
+        if now - last_sent < window:
+            return False
+        self._slack_dedup[title] = now
+        return True
+
     @staticmethod
     def _get_resend_key() -> str:
         return os.environ.get("RESEND_API_KEY", "")
+
+    @staticmethod
+    def _get_slack_webhook_url() -> str:
+        return os.environ.get("SLACK_WEBHOOK_URL", "")
 
     # H3: efficient tail-read instead of loading entire file
     def get_alert_history(self, last_n: int = 20) -> str:

@@ -8,9 +8,13 @@ Covers:
 - send_alert handles Resend API errors gracefully (L6: reads error body)
 - send_alert sanitizes secrets before logging and emailing
 - send_alert rotates log files (H4)
+- send_alert sends Slack webhook for warning/critical
+- send_alert deduplicates Slack messages within window
+- send_alert handles Slack webhook errors gracefully
 - get_alert_history returns recent alerts from log (H3: efficient read)
 - sanitize_secrets replaces known secret patterns (H1: expanded)
 - _email_dedup pruning (L2)
+- _slack_dedup pruning
 """
 
 import time
@@ -90,21 +94,22 @@ class TestSendAlert:
     async def test_email_includes_severity_in_subject(self, alert_manager):
         await alert_manager.send_alert("critical", "Disk full", "/ at 98%")
 
-        call_kwargs = alert_manager.http_session.post.call_args
+        # First post call is email (Resend), second is Slack
+        call_kwargs = alert_manager.http_session.post.call_args_list[0]
         body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         assert "CRITICAL" in body["subject"]
 
     async def test_email_includes_hostname_in_subject(self, alert_manager):
         await alert_manager.send_alert("warning", "High CPU", "CPU at 92%")
 
-        call_kwargs = alert_manager.http_session.post.call_args
+        call_kwargs = alert_manager.http_session.post.call_args_list[0]
         body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         assert "agent-mon@" in body["subject"]
 
     async def test_email_sends_to_configured_recipients(self, alert_manager):
         await alert_manager.send_alert("warning", "Test", "test message")
 
-        call_kwargs = alert_manager.http_session.post.call_args
+        call_kwargs = alert_manager.http_session.post.call_args_list[0]
         body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         assert "ops@example.com" in body["to"]
 
@@ -118,6 +123,8 @@ class TestSendAlertDedup:
 
         config = Config.from_file(config_yaml_file)
         config.alerts.log_file = str(alerts_log_file)
+        # Disable Slack to isolate email dedup behavior
+        config.alerts.slack.enabled = False
         manager = AlertManager(config)
         manager.http_session = AsyncMock()
         response = AsyncMock()
@@ -463,7 +470,8 @@ class TestSendAlertSecretSanitization:
             "Found API key",
             "Key AKIAIOSFODNN7EXAMPLE was exposed",
         )
-        call_kwargs = alert_manager.http_session.post.call_args
+        # First post call is email (Resend)
+        call_kwargs = alert_manager.http_session.post.call_args_list[0]
         body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         assert "AKIA" not in body["text"]
         assert "[REDACTED]" in body["text"]
@@ -499,3 +507,175 @@ class TestDedupPruning:
         assert "old_title" not in alert_manager._email_dedup
         # New entry should remain
         assert "new_title" in alert_manager._email_dedup
+
+
+# ===========================================================================
+# Slack webhook dispatch
+# ===========================================================================
+
+
+class TestSlackAlertDispatch:
+    """Test Slack webhook alert delivery."""
+
+    @pytest.fixture
+    def alert_manager(self, config_yaml_file, alerts_log_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.alerts.log_file = str(alerts_log_file)
+        manager = AlertManager(config)
+        manager.http_session = AsyncMock()
+        response = AsyncMock()
+        response.status = 200
+        manager.http_session.post = AsyncMock(return_value=response)
+        return manager
+
+    async def test_sends_slack_for_warning(self, alert_manager):
+        result = await alert_manager.send_alert("warning", "High CPU", "CPU at 92%")
+        assert "slack: sent" in result
+        # Should have posted to both Resend and Slack
+        assert alert_manager.http_session.post.await_count == 2
+
+    async def test_sends_slack_for_critical(self, alert_manager):
+        result = await alert_manager.send_alert("critical", "Disk full", "/data at 98%")
+        assert "slack: sent" in result
+
+    async def test_skips_slack_for_info(self, alert_manager):
+        result = await alert_manager.send_alert("info", "System check", "All OK")
+        assert "slack" not in result
+
+    async def test_slack_payload_contains_severity_and_title(self, alert_manager):
+        await alert_manager.send_alert("critical", "Disk full", "/ at 98%")
+        # Second post call is Slack (first is email)
+        slack_call = alert_manager.http_session.post.call_args_list[1]
+        body = slack_call.kwargs.get("json") or slack_call[1].get("json")
+        assert "CRITICAL" in body["text"]
+        assert "Disk full" in body["text"]
+
+    async def test_slack_disabled_does_not_post(self, alert_manager):
+        alert_manager.config.alerts.slack.enabled = False
+        result = await alert_manager.send_alert("critical", "Disk full", "/ at 98%")
+        assert "slack" not in result
+        # Only email post, not slack
+        assert alert_manager.http_session.post.await_count == 1
+
+    async def test_slack_no_http_session(self, alert_manager):
+        alert_manager.http_session = None
+        result = await alert_manager.send_alert("warning", "Test", "msg")
+        assert "slack" not in result
+
+    async def test_slack_secrets_redacted(self, alert_manager):
+        await alert_manager.send_alert(
+            "warning",
+            "Found key",
+            "Key sk-ant-api03-abcdefghijklmnopqrstuvwxyz was exposed",
+        )
+        # Second post call is Slack
+        slack_call = alert_manager.http_session.post.call_args_list[1]
+        body = slack_call.kwargs.get("json") or slack_call[1].get("json")
+        assert "sk-ant-" not in body["text"]
+        assert "[REDACTED]" in body["text"]
+
+
+class TestSlackAlertDedup:
+    """Test Slack webhook deduplication."""
+
+    @pytest.fixture
+    def alert_manager(self, config_yaml_file, alerts_log_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.alerts.log_file = str(alerts_log_file)
+        # Disable email to isolate Slack behavior
+        config.alerts.email.enabled = False
+        manager = AlertManager(config)
+        manager.http_session = AsyncMock()
+        response = AsyncMock()
+        response.status = 200
+        manager.http_session.post = AsyncMock(return_value=response)
+        return manager
+
+    async def test_dedup_suppresses_duplicate_slack(self, alert_manager):
+        await alert_manager.send_alert("warning", "High CPU", "CPU at 92%")
+        await alert_manager.send_alert("warning", "High CPU", "CPU at 93%")
+        assert alert_manager.http_session.post.await_count == 1
+
+    async def test_dedup_allows_different_titles(self, alert_manager):
+        await alert_manager.send_alert("warning", "High CPU", "CPU at 92%")
+        await alert_manager.send_alert("warning", "High Memory", "Mem at 88%")
+        assert alert_manager.http_session.post.await_count == 2
+
+    async def test_dedup_allows_after_window_expires(self, alert_manager):
+        alert_manager.config.alerts.slack.dedup_window_minutes = 0
+        await alert_manager.send_alert("warning", "High CPU", "CPU at 92%")
+        await alert_manager.send_alert("warning", "High CPU", "CPU at 93%")
+        assert alert_manager.http_session.post.await_count == 2
+
+    async def test_dedup_on_original_title_not_sanitized(self, alert_manager):
+        await alert_manager.send_alert(
+            "warning",
+            "Found key sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaa",
+            "Leaked",
+        )
+        await alert_manager.send_alert(
+            "warning",
+            "Found key sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbb",
+            "Leaked",
+        )
+        assert alert_manager.http_session.post.await_count == 2
+
+
+class TestSlackAlertErrorHandling:
+    """Test graceful handling of Slack webhook failures."""
+
+    @pytest.fixture
+    def alert_manager(self, config_yaml_file, alerts_log_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.alerts.log_file = str(alerts_log_file)
+        config.alerts.email.enabled = False
+        manager = AlertManager(config)
+        manager.http_session = AsyncMock()
+        return manager
+
+    async def test_handles_slack_api_error(self, alert_manager):
+        response = AsyncMock()
+        response.status = 500
+        response.text = AsyncMock(return_value="server_error")
+        alert_manager.http_session.post = AsyncMock(return_value=response)
+
+        result = await alert_manager.send_alert("critical", "Disk full", "/ at 98%")
+        assert "slack: failed (HTTP 500" in result
+
+    async def test_handles_slack_network_error(self, alert_manager):
+        import aiohttp
+
+        alert_manager.http_session.post = AsyncMock(
+            side_effect=aiohttp.ClientError("connection refused")
+        )
+        result = await alert_manager.send_alert("critical", "Disk full", "/ at 98%")
+        assert "slack: failed" in result
+
+
+class TestSlackDedupPruning:
+    """Test that _slack_dedup dict is pruned."""
+
+    @pytest.fixture
+    def alert_manager(self, config_yaml_file, alerts_log_file):
+        from agent_mon.config import Config
+
+        config = Config.from_file(config_yaml_file)
+        config.alerts.log_file = str(alerts_log_file)
+        config.alerts.slack.dedup_window_minutes = 1
+        manager = AlertManager(config)
+        return manager
+
+    def test_expired_entries_are_pruned(self, alert_manager):
+        alert_manager._slack_dedup["old_title"] = time.time() - 120
+        alert_manager._slack_dedup["new_title"] = time.time()
+
+        alert_manager._should_send_slack("test_title")
+
+        assert "old_title" not in alert_manager._slack_dedup
+        assert "new_title" in alert_manager._slack_dedup

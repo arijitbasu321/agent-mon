@@ -27,9 +27,17 @@ class EmailConfig:
 
 
 @dataclass
+class SlackConfig:
+    enabled: bool = False
+    min_severity: str = "warning"
+    dedup_window_minutes: int = 15
+
+
+@dataclass
 class AlertsConfig:
     log_file: str = "/var/log/agent-mon.log"
     email: EmailConfig = field(default_factory=EmailConfig)
+    slack: SlackConfig = field(default_factory=SlackConfig)
 
 
 @dataclass
@@ -185,9 +193,31 @@ class Config:
                 f"must be one of {valid_severities}"
             )
 
+        slack = cls._parse_slack(raw.get("slack", {}))
+
         return AlertsConfig(
             log_file=raw.get("log_file", "/var/log/agent-mon.log"),
             email=email,
+            slack=slack,
+        )
+
+    @classmethod
+    def _parse_slack(cls, raw: dict) -> SlackConfig:
+        if not raw:
+            return SlackConfig()
+
+        valid_severities = {"info", "warning", "critical"}
+        min_severity = raw.get("min_severity", "warning")
+        if min_severity not in valid_severities:
+            raise ConfigError(
+                f"Invalid slack min_severity '{min_severity}', "
+                f"must be one of {valid_severities}"
+            )
+
+        return SlackConfig(
+            enabled=raw.get("enabled", False),
+            min_severity=min_severity,
+            dedup_window_minutes=raw.get("dedup_window_minutes", 15),
         )
 
     @classmethod
@@ -305,4 +335,10 @@ class Config:
             raise ConfigError(
                 "RESEND_API_KEY environment variable is not set "
                 "(required when email alerts or heartbeat are enabled)"
+            )
+
+        if self.alerts.slack.enabled and not os.environ.get("SLACK_WEBHOOK_URL"):
+            raise ConfigError(
+                "SLACK_WEBHOOK_URL environment variable is not set "
+                "(required when slack alerts are enabled)"
             )

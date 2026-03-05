@@ -35,6 +35,11 @@ SAMPLE_CONFIG_DICT = {
             "min_severity": "warning",
             "dedup_window_minutes": 15,
         },
+        "slack": {
+            "enabled": True,
+            "min_severity": "warning",
+            "dedup_window_minutes": 15,
+        },
     },
     "docker": {
         "enabled": True,
@@ -124,6 +129,7 @@ def env_with_api_keys(monkeypatch):
     """Set required environment variables for API keys."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-123")
     monkeypatch.setenv("RESEND_API_KEY", "re_test_key_456")
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T00/B00/xxx")
 
 
 @pytest.fixture
@@ -131,6 +137,7 @@ def env_without_api_keys(monkeypatch):
     """Ensure API key environment variables are not set."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
 
 
 @pytest.fixture
